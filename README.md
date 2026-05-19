@@ -97,11 +97,11 @@ A virtual environment keeps OmniTide's dependencies isolated from everything els
 
 ```bash
 # Create the venv
-python -m venv ~/Tidal_Env
+python -m venv ~/OmniTide_Env
 
 # Activate it
-source ~/Tidal_Env/bin/activate        # bash or zsh
-source ~/Tidal_Env/bin/activate.fish   # fish shell
+source ~/OmniTide_Env/bin/activate        # bash or zsh
+source ~/OmniTide_Env/bin/activate.fish   # fish shell
 
 # Install dependencies
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
@@ -113,15 +113,15 @@ python OmniTide.py --sync
 To use it again in future, just activate the venv first:
 
 ```bash
-source ~/Tidal_Env/bin/activate
+source ~/OmniTide_Env/bin/activate
 python OmniTide.py --sync
 ```
 
 #### Windows
 
 ```bat
-python -m venv Tidal_Env
-Tidal_Env\Scripts\activate
+python -m venv OmniTide_Env
+OmniTide_Env\Scripts\activate
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
 python OmniTide.py --sync
 ```
@@ -236,35 +236,34 @@ The sync matches songs by artist and title. If your files have missing or wrong 
 
 ---
 
----
-
 ## Customising the sync
 
-Near the top of `OmniTide.py`, there are two configuration sets you can edit to fix common syncing errors.
+Near the top of `OmniTide.py`, there are two configuration sets you can edit to fix common syncing issues.
 
-#### 1. The `SKIP_AS_ARTIST` List (For Mixes & Compilations)
+### `SKIP_AS_ARTIST` — For mixes and compilations
 
-**What it does:** Prevents OmniTide from using the folder name as a search term, but *still syncs the songs*.
+**What it does:** Prevents OmniTide from using the folder name as the artist when searching, but still syncs the songs.
 
-**Why you need it:** If a song file doesn't have the artist in its filename (e.g., `01 - Get Lucky.flac`), OmniTide guesses the artist by looking at the folder it sits in. If the folder is called `Daft Punk`, this works perfectly! 
-However, if the folder is a mix called `Workout Tracks`, OmniTide will search Tidal for a band named "Workout Tracks" and fail to find your song.
+**Why you need it:** If a song file doesn't have the artist in its filename (e.g., `01 - Get Lucky.flac`), OmniTide guesses the artist from the folder name. If the folder is called `Daft Punk` this works perfectly. However, if the folder is a mix called `Workout Tracks`, OmniTide will search Tidal for a band named "Workout Tracks" and fail to find the song.
 
-By adding your mix folders here, you tell OmniTide: *"Sync these songs, but don't assume the folder name is the band."*
-```bash
-SKIP_AS_ARTIST = {"Workout Tracks", "Summer 2024", "misc", "randoms"}
+Adding the folder name here tells OmniTide: *"Sync these songs, but don't assume the folder name is the artist."*
+
+```python
+# Add your mix/compilation folder names here
+SKIP_AS_ARTIST: set[str] = {"Workout Tracks", "Summer 2024", "misc"}
 ```
-# Add your custom mix/compilation folders here
 
-#### 2. The `SKIP_PLAYLISTS` List (Ignore Entirely)
+### `SKIP_PLAYLISTS` — Ignore folders entirely
 
-**What it does:** Completely blocks OmniTide from looking at these folders.
+**What it does:** Completely skips these folders during sync.
 
-Why you need it: If there is a folder on your phone containing audio books, voice memos, or playlists you have already perfectly synced and don't want the script touching again, put them here to save time and API calls.
+**Why you need it:** If you have folders containing audiobooks, voice memos, or playlists you've already imported and don't want touched again, add them here to save time.
 
-### OmniTide will completely ignore these folders
-```bash
-SKIP_PLAYLISTS = {"Audiobooks", "Voice Records", "My Perfect Playlist"}
+```python
+# OmniTide will completely ignore these folders
+SKIP_PLAYLISTS: set[str] = {"Audiobooks", "Voice Records", "My Perfect Playlist"}
 ```
+
 ---
 
 ## Downloading from Tidal
@@ -353,15 +352,17 @@ Make sure ffmpeg is installed and on your PATH. On Linux: `sudo pacman -S ffmpeg
 On macOS, make sure **Share iTunes Library XML** is enabled under Music → Settings → Advanced. Or pass the path manually with `--itunes-path`.
 
 **Venv broken after Python update**
-Delete the venv folder (`rm -rf ~/Tidal_Env` on Linux/macOS, or delete the `Tidal_Env` folder on Windows) and recreate it following the venv instructions above. Your `token.json` and `song_files.txt` are safe.
+Delete the venv folder (`rm -rf ~/OmniTide_Env` on Linux/macOS, or delete the `OmniTide_Env` folder on Windows) and recreate it following the venv instructions above. Your `token.json` and `song_files.txt` are safe.
 
 **Download stops partway through**
 Re-run the same command. Already-downloaded files are skipped automatically so it picks up where it left off.
 
-⚠️ Disclaimer & Warnings
+---
 
->This project is strictly for educational and personal archival purposes.
+## Disclaimer
 
->You must have an active, premium Tidal subscription to utilize this tool. Do not use this script to distribute copyrighted material, bypass digital rights management (DRM) for piracy, or violate Tidal's Terms of Service.
-
->The developers assume no liability for how this tool is used or any potential account bans resulting from excessive API calls. Use at your own risk.
+> This project is strictly for educational and personal archival purposes.
+>
+> You must have an active Tidal subscription to use this tool. Do not use OmniTide to distribute copyrighted material, bypass DRM for piracy, or violate Tidal's Terms of Service.
+>
+> The developers assume no liability for how this tool is used or any potential account bans resulting from excessive API calls. Use at your own risk.
