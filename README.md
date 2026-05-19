@@ -24,18 +24,45 @@ There are three ways to run OmniTide. Pick one.
 
 ---
 
-### Option 1 — Compiled binary (easiest, Linux only)
+### Option 1 — Python venv (recommended)
 
-Download `OmniTide` from the releases page. No Python required.
+A virtual environment keeps OmniTide's dependencies isolated from everything else. This is the cleanest approach.
+
+> **Important:** If you reinstall or upgrade Python, you'll need to delete and recreate the venv. Your `token.json` and `song_files.txt` are stored outside the venv and won't be affected.
+
+#### Linux / macOS
 
 ```bash
-chmod +x OmniTide
-./OmniTide --sync
+# Create the venv
+python -m venv ~/OmniTide_Env
+
+# Activate it
+source ~/OmniTide_Env/bin/activate        # bash or zsh
+source ~/OmniTide_Env/bin/activate.fish   # fish shell
+
+# Install dependencies
+pip install tidalapi requests mutagen pathvalidate python-ffmpeg
+
+# Run
+python OmniTide.py --sync
 ```
 
-> Built for Linux x86_64. Windows and macOS users should use Option 2 or 3.
+To use it again in future, just activate the venv first:
 
----
+```bash
+source ~/OmniTide_Env/bin/activate
+python OmniTide.py --sync
+```
+
+#### Windows
+
+```bat
+python -m venv OmniTide_Env
+OmniTide_Env\Scripts\activate
+pip install tidalapi requests mutagen pathvalidate python-ffmpeg
+python OmniTide.py --sync
+```
+
 
 ### Option 2 — Python script, system-wide
 
@@ -87,44 +114,15 @@ python OmniTide.py --sync
 
 ---
 
-### Option 3 — Python venv (recommended)
-
-A virtual environment keeps OmniTide's dependencies isolated from everything else. This is the cleanest approach.
-
-> **Important:** If you reinstall or upgrade Python, you'll need to delete and recreate the venv. Your `token.json` and `song_files.txt` are stored outside the venv and won't be affected.
-
-#### Linux / macOS
+### Option 3 — Building the binary yourself
 
 ```bash
-# Create the venv
-python -m venv ~/OmniTide_Env
-
-# Activate it
-source ~/OmniTide_Env/bin/activate        # bash or zsh
-source ~/OmniTide_Env/bin/activate.fish   # fish shell
-
-# Install dependencies
-pip install tidalapi requests mutagen pathvalidate python-ffmpeg
-
-# Run
-python OmniTide.py --sync
+pip install pyinstaller
+pyinstaller --onefile OmniTide.py
 ```
 
-To use it again in future, just activate the venv first:
+The binary will be at `dist/OmniTide`. It runs on the same OS and architecture it was built on — build on Linux for Linux, Windows for Windows.
 
-```bash
-source ~/OmniTide_Env/bin/activate
-python OmniTide.py --sync
-```
-
-#### Windows
-
-```bat
-python -m venv OmniTide_Env
-OmniTide_Env\Scripts\activate
-pip install tidalapi requests mutagen pathvalidate python-ffmpeg
-python OmniTide.py --sync
-```
 
 ---
 
@@ -323,14 +321,6 @@ python OmniTide.py --sync --download "https://tidal.com/browse/album/12345678"
 
 ---
 
-## Building the binary yourself
-
-```bash
-pip install pyinstaller
-pyinstaller --onefile OmniTide.py
-```
-
-The binary will be at `dist/OmniTide`. It runs on the same OS and architecture it was built on — build on Linux for Linux, Windows for Windows.
 
 ---
 
