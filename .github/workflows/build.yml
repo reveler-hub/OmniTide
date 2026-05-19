@@ -1,0 +1,42 @@
+name: Build OmniTide
+
+on:
+  push:
+    tags:
+      - "v*"  # Triggers on version tags like v1.0, v1.2.3
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-20.04
+            output_name: OmniTide-linux
+          - os: windows-latest
+            output_name: OmniTide-windows.exe
+          - os: macos-latest
+            output_name: OmniTide-macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller tidalapi requests mutagen pathvalidate python-ffmpeg
+
+      - name: Build binary
+        run: |
+          pyinstaller --onefile --name ${{ matrix.output_name }} OmniTide.py
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.output_name }}
