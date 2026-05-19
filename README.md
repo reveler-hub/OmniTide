@@ -242,7 +242,7 @@ The sync matches songs by artist and title. If your files have missing or wrong 
 
 Near the top of `OmniTide.py`, there are two configuration sets you can edit to fix common syncing errors.
 
-### 1. The `SKIP_AS_ARTIST` List (For Mixes & Compilations)
+#### 1. The `SKIP_AS_ARTIST` List (For Mixes & Compilations)
 
 **What it does:** Prevents OmniTide from using the folder name as a search term, but *still syncs the songs*.
 
@@ -250,20 +250,21 @@ Near the top of `OmniTide.py`, there are two configuration sets you can edit to 
 However, if the folder is a mix called `Workout Tracks`, OmniTide will search Tidal for a band named "Workout Tracks" and fail to find your song.
 
 By adding your mix folders here, you tell OmniTide: *"Sync these songs, but don't assume the folder name is the band."*
-
-
-# Add your custom mix/compilation folders here
+```bash
 SKIP_AS_ARTIST = {"Workout Tracks", "Summer 2024", "misc", "randoms"}
+```
+# Add your custom mix/compilation folders here
 
-### 2. The 'SKIP_PLAYLISTS List' (Ignore Entirely)
+#### 2. The `SKIP_PLAYLISTS` List (Ignore Entirely)
 
 **What it does:** Completely blocks OmniTide from looking at these folders.
 
 Why you need it: If there is a folder on your phone containing audio books, voice memos, or playlists you have already perfectly synced and don't want the script touching again, put them here to save time and API calls.
 
-# OmniTide will completely ignore these folders
+### OmniTide will completely ignore these folders
+```bash
 SKIP_PLAYLISTS = {"Audiobooks", "Voice Records", "My Perfect Playlist"}
-
+```
 ---
 
 ## Downloading from Tidal
@@ -356,3 +357,11 @@ Delete the venv folder (`rm -rf ~/Tidal_Env` on Linux/macOS, or delete the `Tida
 
 **Download stops partway through**
 Re-run the same command. Already-downloaded files are skipped automatically so it picks up where it left off.
+
+⚠️ Disclaimer & Warnings
+
+>This project is strictly for educational and personal archival purposes.
+
+>You must have an active, premium Tidal subscription to utilize this tool. Do not use this script to distribute copyrighted material, bypass digital rights management (DRM) for piracy, or violate Tidal's Terms of Service.
+
+>The developers assume no liability for how this tool is used or any potential account bans resulting from excessive API calls. Use at your own risk.
