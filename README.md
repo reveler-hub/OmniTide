@@ -15,6 +15,7 @@ No third-party sync services. Just a Tidal account.
 - Python 3.10 or newer
 - `ffmpeg` installed on your system
 - For Android sync: ADB (Android Debug Bridge)
+- For Iphones: iTunes
 
 ---
 
