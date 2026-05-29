@@ -15,9 +15,7 @@ No third-party sync services. Just a Tidal account.
 - Python 3.10 or newer
 - `ffmpeg` installed on your system
 - For Android sync: ADB (Android Debug Bridge)
-- For Iphones: iTunes
-
----
+- For iPhones: iTunes
 
 ---
 
@@ -29,14 +27,13 @@ No third-party sync services. Just a Tidal account.
 
 1. Go to the **[Releases](https://github.com/reveler-hub/OmniTide/releases)** page.
 2. Download the latest version for your operating system:
-   - `OmniTide` (Linux)
+   - `OmniTide-linux` (Linux)
    - `OmniTide.exe` (Windows)
-   - `OmniTide` (macOS)
+   - `OmniTide-macos` (macOS)
 3. **Linux & macOS only**: Make it executable:
    ```bash
-   chmod +x OmniTide
-   ./OmniTide-linux
-   ./OmniTide-macos
+   chmod +x OmniTide-linux    # or OmniTide-macos
+   ```
 
 ### Option 2 — Python venv
 
@@ -58,15 +55,15 @@ source ~/OmniTide_Env/bin/activate.fish   # fish shell
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
 
 # Run
-./OmniTide.py --sync
+./OmniTide.py --login
 ```
 
 To use it again in future, just activate the venv first:
 
 ```bash
 source ~/OmniTide_Env/bin/activate
-#source ~/OmniTide_Env/bin/activate.fish
-./OmniTide.py --sync
+# source ~/OmniTide_Env/bin/activate.fish
+./OmniTide.py --login
 ```
 
 #### Windows
@@ -75,7 +72,7 @@ source ~/OmniTide_Env/bin/activate
 python -m venv OmniTide_Env
 OmniTide_Env\Scripts\activate
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
-python OmniTide.py --sync
+.\OmniTide.py --login
 ```
 
 ---
@@ -89,19 +86,30 @@ pyinstaller --onefile OmniTide.py
 
 The binary will be at `dist/OmniTide`. It runs on the same OS and architecture it was built on — build on Linux for Linux, Windows for Windows.
 
-
 ---
 
 ## First run — Tidal login
 
-On first run, the script will print a URL and wait for you to log in:
+Run `--login` first to authenticate before doing anything else. The script will print a URL and wait for you to log in:
 
 ```
 🔐 No token found — starting Tidal login...
 Please visit: https://link.tidal.com/XXXXX
 ```
 
-Open the URL in your browser, log in to Tidal, and the script continues automatically. Your session is saved to `token.json` — you won't need to log in again unless you delete it. The token refreshes itself on each run.
+**Binary:**
+```bash
+./OmniTide-linux --login    # Linux
+./OmniTide-macos --login    # macOS
+.\OmniTide.exe --login      # Windows
+```
+
+**venv:**
+```bash
+./OmniTide.py --login
+```
+
+Open the URL in your browser, log in to Tidal, and the script continues automatically. Your session is saved to `token.json` — you won't need to log in again unless you delete it. The token refreshes itself on each subsequent run.
 
 ---
 
@@ -117,7 +125,10 @@ Open the URL in your browser, log in to Tidal, and the script continues automati
 4. Run:
 
 ```bash
-python OmniTide.py --sync
+./OmniTide-linux --sync    # Linux binary
+./OmniTide-macos --sync    # macOS binary
+.\OmniTide.exe --sync      # Windows binary
+./OmniTide.py --sync       # venv
 ```
 
 The script scans `/sdcard/Music/` on your phone. Each subfolder becomes a Tidal playlist. Songs are matched on Tidal by artist and title.
@@ -135,7 +146,9 @@ You should see your device listed. If it shows `unauthorized`, accept the prompt
 ### iTunes / Apple Music (macOS and Windows)
 
 ```bash
-python OmniTide.py --itunes
+./OmniTide-macos --itunes    # macOS binary
+.\OmniTide.exe --itunes      # Windows binary
+./OmniTide.py --itunes       # venv
 ```
 
 The script auto-detects your library file at:
@@ -145,7 +158,7 @@ The script auto-detects your library file at:
 If your library is in a different location:
 
 ```bash
-python OmniTide.py --itunes --itunes-path "path/to/iTunes Music Library.xml"
+./OmniTide.py --itunes --itunes-path "path/to/iTunes Music Library.xml"
 ```
 
 Tracks are grouped by your iTunes playlists. Tracks not in any playlist go into a `Music` playlist on Tidal.
@@ -167,13 +180,7 @@ Artist - Song Title
 Artist - Song Title
 ```
 
-Then run:
-
-```bash
-python OmniTide.py --sync
-```
-
-The script will use `song_files.txt` automatically if it exists.
+Then run `--sync` as normal. The script will use `song_files.txt` automatically if it exists.
 
 ---
 
@@ -236,13 +243,13 @@ Paste any Tidal URL for a track, album, or playlist:
 
 ```bash
 # Single track
-python OmniTide.py --download "https://tidal.com/browse/track/12345678"
+./OmniTide.py --download "https://tidal.com/browse/track/12345678"
 
 # Album
-python OmniTide.py --download "https://tidal.com/browse/album/12345678"
+./OmniTide.py --download "https://tidal.com/browse/album/12345678"
 
 # Playlist
-python OmniTide.py --download "https://tidal.com/browse/playlist/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+./OmniTide.py --download "https://tidal.com/browse/playlist/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
 Files are saved to `~/Tidal Download/` and organised as:
@@ -268,7 +275,7 @@ Each file includes full metadata: title, artist, album artist, track number, dis
 ## Running sync and download together
 
 ```bash
-python OmniTide.py --sync --download "https://tidal.com/browse/album/12345678"
+./OmniTide.py --sync --download "https://tidal.com/browse/album/12345678"
 ```
 
 ---
@@ -277,6 +284,7 @@ python OmniTide.py --sync --download "https://tidal.com/browse/album/12345678"
 
 | Flag | Description |
 |---|---|
+| `--login` | Log in to Tidal and save your session token |
 | `--sync` | Scan Android phone and sync to Tidal playlists |
 | `--itunes` | Sync from iTunes / Apple Music library |
 | `--itunes-path PATH` | Path to iTunes Library XML (auto-detected if not provided) |
@@ -287,13 +295,10 @@ python OmniTide.py --sync --download "https://tidal.com/browse/album/12345678"
 
 ---
 
-
----
-
 ## Troubleshooting
 
 **Login prompt appears every run / 401 errors**
-Delete `token.json` and run again. A fresh login will be performed automatically.
+Delete `token.json` and run `--login` again. A fresh login will be performed automatically.
 
 **ADB says "no devices" or "unauthorized"**
 Make sure USB Debugging is enabled and you've accepted the authorisation prompt on your phone. Run `adb devices` to check the connection. Try unplugging and reconnecting the USB cable.
@@ -302,7 +307,7 @@ Make sure USB Debugging is enabled and you've accepted the authorisation prompt 
 Run MusicBrainz Picard on your library to fix tags before syncing. After a sync run, check `unmatched_songs.txt` for a full list of everything that wasn't found.
 
 **ffmpeg not found**
-Make sure ffmpeg is installed and on your PATH. On Linux: `sudo pacman -S ffmpeg` or `sudo apt install ffmpeg`. Downloads will still work without it but the seekbar may be broken in some players.
+Make sure ffmpeg is installed and on your PATH. On Linux: `sudo apt install ffmpeg` or `sudo pacman -S ffmpeg`. Downloads will still work without it but the seekbar may be broken in some players.
 
 **iTunes library not found**
 On macOS, make sure **Share iTunes Library XML** is enabled under Music → Settings → Advanced. Or pass the path manually with `--itunes-path`.
