@@ -44,6 +44,9 @@ A virtual environment keeps OmniTide's dependencies isolated from everything els
 #### Linux / macOS
 
 ```bash
+git clone https://github.com/reveler-hub/OmniTide
+cd OmniTide
+
 # Create the venv
 python3 -m venv ~/OmniTide_Env
 
@@ -69,9 +72,19 @@ source ~/OmniTide_Env/bin/activate
 #### Windows
 
 ```bat
+git clone https://github.com/reveler-hub/OmniTide
+cd OmniTide
+
+# Create the venv
 python -m venv OmniTide_Env
+
+# Activate it
 OmniTide_Env\Scripts\activate
+
+# Install dependencies
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
+
+# Run
 .\OmniTide.py --login
 ```
 
