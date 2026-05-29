@@ -2,9 +2,10 @@
 """
 OmniTide: Phone Sync & Downloader
 Usage:
-  python OmniTide.py --sync                  (Scan phone, build Tidal playlists)
-  python OmniTide.py --download <URL>        (Download track/album/playlist)
-  python OmniTide.py --sync --download <URL> (Both)
+  ./OmniTide.py --login                      (Log in to Tidal and save session)
+  ./OmniTide.py --sync                       (Scan phone, build Tidal playlists)
+  ./OmniTide.py --download <URL>             (Download track/album/playlist)
+  ./OmniTide.py --sync --download <URL>      (Both)
 
 song_files.txt format:
   [Playlist Name]
@@ -663,6 +664,7 @@ def process_download(session: tidalapi.Session, url: str):
 
 def main():
     parser = argparse.ArgumentParser(description="OmniTide: Phone Sync & Downloader")
+    parser.add_argument("--login",         action="store_true", help="Log in to Tidal and save session token")
     parser.add_argument("--sync",          action="store_true", help="Scan phone and sync to Tidal playlists")
     parser.add_argument("--itunes",        action="store_true", help="Sync from iTunes/Apple Music library instead of phone")
     parser.add_argument("--itunes-path",   type=str, metavar="PATH", help="Path to iTunes Music Library.xml (auto-detected if omitted)")
@@ -672,11 +674,15 @@ def main():
     parser.add_argument("--keep-existing", action="store_true", help="Don't replace existing same-name playlists")
     args = parser.parse_args()
 
-    if not args.sync and not args.download:
+    if not any([args.login, args.sync, args.itunes, args.download]):
         parser.print_help()
         sys.exit(1)
 
     session, access_token = load_session(TOKEN_PATH)
+
+    if args.login:
+        print("✅ Login complete.")
+        return
 
     if args.sync or args.itunes:
         print("\n🚀 Syncing...")
