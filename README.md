@@ -18,13 +18,26 @@ No third-party sync services. Just a Tidal account.
 
 ---
 
-## Installation
-
-There are three ways to run OmniTide. Pick one.
-
 ---
 
-### Option 1 — Python venv (recommended)
+## Installation
+
+**The easiest way** is to use the **pre-built binaries** (no Python or dependencies needed).
+
+### Option 1 — Pre-built Binary (Recommended — Easiest)
+
+1. Go to the **[Releases](https://github.com/reveler-hub/OmniTide/releases)** page.
+2. Download the latest version for your operating system:
+   - `OmniTide` (Linux)
+   - `OmniTide.exe` (Windows)
+   - `OmniTide` (macOS)
+3. **Linux & macOS only**: Make it executable:
+   ```bash
+   chmod +x OmniTide
+   ./OmniTide-linux
+   ./OmniTide-macos
+
+### Option 2 — Python venv
 
 A virtual environment keeps OmniTide's dependencies isolated from everything else. This is the cleanest approach.
 
@@ -34,7 +47,7 @@ A virtual environment keeps OmniTide's dependencies isolated from everything els
 
 ```bash
 # Create the venv
-python -m venv ~/OmniTide_Env
+python3 -m venv ~/OmniTide_Env
 
 # Activate it
 source ~/OmniTide_Env/bin/activate        # bash or zsh
@@ -44,14 +57,15 @@ source ~/OmniTide_Env/bin/activate.fish   # fish shell
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
 
 # Run
-python OmniTide.py --sync
+./OmniTide.py --sync
 ```
 
 To use it again in future, just activate the venv first:
 
 ```bash
 source ~/OmniTide_Env/bin/activate
-python OmniTide.py --sync
+#source ~/OmniTide_Env/bin/activate.fish
+./OmniTide.py --sync
 ```
 
 #### Windows
@@ -60,55 +74,6 @@ python OmniTide.py --sync
 python -m venv OmniTide_Env
 OmniTide_Env\Scripts\activate
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
-python OmniTide.py --sync
-```
-
-
-### Option 2 — Python script, system-wide
-
-Install the dependencies globally. Simple, but mixes packages with your system Python.
-
-#### Linux
-
-```bash
-# Arch / Manjaro
-sudo pacman -S python python-pip ffmpeg android-tools
-
-# Debian / Ubuntu / Mint
-sudo apt install python3 python3-pip ffmpeg adb
-
-# Fedora
-sudo dnf install python3 python3-pip ffmpeg android-tools
-```
-
-```bash
-pip install tidalapi requests mutagen pathvalidate python-ffmpeg --break-system-packages
-```
-
-> `--break-system-packages` is required on newer Linux distros that protect the system Python.
-
-#### macOS
-
-```bash
-# Install Homebrew if you don't have it: https://brew.sh
-brew install python ffmpeg android-platform-tools
-pip3 install tidalapi requests mutagen pathvalidate python-ffmpeg
-```
-
-#### Windows
-
-1. Install [Python](https://python.org/downloads) — tick **"Add Python to PATH"** during setup
-2. Install [ffmpeg](https://ffmpeg.org/download.html) and add it to your PATH
-3. For Android sync, download [ADB Platform Tools](https://developer.android.com/tools/releases/platform-tools) and add to PATH
-4. Open a terminal and run:
-
-```bat
-pip install tidalapi requests mutagen pathvalidate python-ffmpeg
-```
-
-Then run the script:
-
-```bat
 python OmniTide.py --sync
 ```
 
