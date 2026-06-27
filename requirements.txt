@@ -1,0 +1,5 @@
+tidalapi
+requests
+mutagen
+pathvalidate
+python-ffmpeg
