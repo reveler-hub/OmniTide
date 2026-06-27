@@ -5,7 +5,18 @@ A single-file Python tool that does two things:
 - **Sync** — Scans your music library (Android phone or iTunes/Apple Music) and creates matching playlists on Tidal
 - **Download** — Downloads tracks, albums, or playlists from Tidal as FLAC files with full metadata and album art
 
-No third-party sync services. Just a Tidal account.
+No third‑party sync services. Just a Tidal account.
+
+---
+
+## New in this version
+
+- **Batch adding** – up to 50 tracks per API call, making sync **up to 50× faster**.
+- **Tidal ID embedding** – every downloaded track stores its Tidal ID in a custom tag. Future syncs use these IDs for **instant, 100% accurate** additions – no searching, no mismatches.
+- **Local library indexing** – `--build-local` scans your music folder and builds a song file with Tidal IDs.
+- **ID fetching** – `--fetch-ids` reads an existing song file, searches Tidal for missing IDs, and updates it (and can write IDs back into the audio files).
+- **Custom song file** – `--song-file` lets you use any filename, so you can manage multiple libraries.
+- **Backup your playlists** – the included `Omni_List.py` exports all your Tidal playlists with track IDs, ready to re‑import.
 
 ---
 
@@ -15,15 +26,15 @@ No third-party sync services. Just a Tidal account.
 - Python 3.10 or newer
 - `ffmpeg` installed on your system
 - For Android sync: ADB (Android Debug Bridge)
-- For iPhones: iTunes
+- For iTunes sync: iTunes with XML sharing enabled
 
 ---
 
 ## Installation
 
-**The easiest way** is to use the **pre-built binaries** (no Python or dependencies needed).
+**The easiest way** is to use the **pre‑built binaries** (no Python or dependencies needed).
 
-### Option 1 — Pre-built Binary (Recommended — Easiest)
+### Option 1 — Pre‑built Binary (Recommended)
 
 1. Go to the **[Releases](https://github.com/reveler-hub/OmniTide/releases)** page.
 2. Download the latest version for your operating system:
@@ -35,24 +46,16 @@ No third-party sync services. Just a Tidal account.
    chmod +x OmniTide-linux    # or OmniTide-macos
    ```
 
-### Option 2 — Python venv
-
-A virtual environment keeps OmniTide's dependencies isolated from everything else. This is the cleanest approach.
-
-> **Important:** If you reinstall or upgrade Python, you'll need to delete and recreate the venv. Your `token.json` and `song_files.txt` are stored outside the venv and won't be affected.
-
-#### Linux / macOS
+### Option 2 — Python venv (for developers)
 
 ```bash
 git clone https://github.com/reveler-hub/OmniTide
 cd OmniTide
 
-# Create the venv
+# Create and activate a virtual environment
 python3 -m venv ~/OmniTide_Env
-
-# Activate it
-source ~/OmniTide_Env/bin/activate        # bash or zsh
-source ~/OmniTide_Env/bin/activate.fish   # fish shell
+source ~/OmniTide_Env/bin/activate   # Linux/macOS
+# or OmniTide_Env\Scripts\activate   # Windows
 
 # Install dependencies
 pip install tidalapi requests mutagen pathvalidate python-ffmpeg
@@ -60,276 +63,187 @@ pip install tidalapi requests mutagen pathvalidate python-ffmpeg
 # Run
 ./OmniTide.py --login
 ```
-
-To use it again in future, just activate the venv first:
-
-```bash
-source ~/OmniTide_Env/bin/activate
-# source ~/OmniTide_Env/bin/activate.fish
-./OmniTide.py --login
-```
-
-#### Windows
-
-```bat
-git clone https://github.com/reveler-hub/OmniTide
-cd OmniTide
-
-# Create the venv
-python -m venv OmniTide_Env
-
-# Activate it
-OmniTide_Env\Scripts\activate
-
-# Install dependencies
-pip install tidalapi requests mutagen pathvalidate python-ffmpeg
-
-# Run
-.\OmniTide.py --login
-```
-
----
-
-### Option 3 — Building the binary yourself
-
-```bash
-pip install pyinstaller
-pyinstaller --onefile OmniTide.py
-```
-
-The binary will be at `dist/OmniTide`. It runs on the same OS and architecture it was built on — build on Linux for Linux, Windows for Windows.
 
 ---
 
 ## First run — Tidal login
 
-Run `--login` first to authenticate before doing anything else. The script will print a URL and wait for you to log in:
+Run `--login` first to authenticate:
 
-```
-🔐 No token found — starting Tidal login...
-Please visit: https://link.tidal.com/XXXXX
-```
-
-**Binary:**
 ```bash
-./OmniTide-linux --login    # Linux
-./OmniTide-macos --login    # macOS
-.\OmniTide.exe --login      # Windows
+./OmniTide-linux --login    # Linux binary
+.\OmniTide.exe --login      # Windows binary
+./OmniTide.py --login       # venv
 ```
 
-**venv:**
-```bash
-./OmniTide.py --login
-```
-
-Open the URL in your browser, log in to Tidal, and the script continues automatically. Your session is saved to `token.json` — you won't need to log in again unless you delete it. The token refreshes itself on each subsequent run.
+The script prints a URL. Open it in your browser, log in to Tidal, and the script continues automatically. Your session is saved to `token.json` – you won't need to log in again unless you delete it.
 
 ---
 
 ## Syncing your library to Tidal
 
+OmniTide supports three sources: **Android phone**, **iTunes/Apple Music**, and **manual song files**.
+
 ### Android phone
 
-1. Enable **USB Debugging** on your phone:
-   - Go to **Settings → About Phone** and tap **Build Number** 7 times to unlock Developer Options
-   - Go to **Settings → Developer Options** and enable **USB Debugging**
-2. Connect your phone via USB
-3. Accept the ADB authorisation prompt on your phone when it appears
-4. Run:
+1. Enable **USB Debugging** on your phone (Settings → About Phone → tap Build Number 7 times → Developer Options → USB Debugging).
+2. Connect your phone via USB and accept the ADB authorisation prompt.
+3. Run:
 
 ```bash
-./OmniTide-linux --sync    # Linux binary
-./OmniTide-macos --sync    # macOS binary
-.\OmniTide.exe --sync      # Windows binary
-./OmniTide.py --sync       # venv
+./OmniTide-linux --sync        # binary
+./OmniTide.py --sync           # venv
 ```
 
-The script scans `/sdcard/Music/` on your phone. Each subfolder becomes a Tidal playlist. Songs are matched on Tidal by artist and title.
-
-To confirm ADB can see your phone before running:
-
-```bash
-adb devices
-```
-
-You should see your device listed. If it shows `unauthorized`, accept the prompt on your phone.
-
----
+The script scans `/sdcard/Music/`. Each subfolder becomes a Tidal playlist. Songs are matched on Tidal by artist and title.
 
 ### iTunes / Apple Music (macOS and Windows)
 
 ```bash
-./OmniTide-macos --itunes    # macOS binary
-.\OmniTide.exe --itunes      # Windows binary
-./OmniTide.py --itunes       # venv
+./OmniTide-macos --sync --source itunes   # binary
+./OmniTide.py --sync --source itunes      # venv
 ```
 
-The script auto-detects your library file at:
+The `--itunes` flag is an alias for `--source itunes` (so `--sync --itunes` still works).
+
+The script auto‑detects your library file at:
 - **macOS:** `~/Music/Music/Music Library.xml`
 - **Windows:** `%USERPROFILE%\Music\iTunes\iTunes Music Library.xml`
 
-If your library is in a different location:
+If your library is elsewhere, specify it:
 
 ```bash
-./OmniTide.py --itunes --itunes-path "path/to/iTunes Music Library.xml"
+./OmniTide.py --sync --source itunes --itunes-path "path/to/library.xml"
 ```
 
-Tracks are grouped by your iTunes playlists. Tracks not in any playlist go into a `Music` playlist on Tidal.
+### Manual song file
 
-> **Note:** You may need to enable XML sharing in iTunes/Music. On macOS: **Music → Settings → Advanced → Share iTunes Library XML with other applications.**
-
----
-
-### Manual mode — provide your own song list
-
-If you can't use ADB or iTunes, create a plain text file called `song_files.txt` in the same folder as the script. Use this format:
+Create a plain text file (default: `song_files.txt`) with this format:
 
 ```
 [Playlist Name]
 Artist - Song Title
-Artist - Song Title
+Artist - Song Title [TID:123456789]   # optional Tidal ID
 
 [Another Playlist]
 Artist - Song Title
 ```
 
-Then run `--sync` as normal. The script will use `song_files.txt` automatically if it exists.
+Then run:
+
+```bash
+./OmniTide.py --sync --song-file my_songs.txt
+```
+
+If a line includes `[TID:...]`, the track is added instantly – no search, no errors. If the ID is missing, the script falls back to searching by artist/title.
 
 ---
 
-### iPhone
+## Building a song file from your local music folder
 
-Direct iPhone scanning is not supported. Use one of these alternatives:
+If you have a folder of downloaded music (e.g., from OmniTide downloads or elsewhere), you can index it and generate a `song_files.txt` with Tidal IDs.
 
-- **iTunes on Mac or Windows** — use the `--itunes` flag above
-- **Manual mode** — create `song_files.txt` by hand or export from another app
+```bash
+# Basic scan – reads existing TIDALID tags if present
+./OmniTide.py --build-local ~/Tidal\ Download
+
+# Also fetch missing IDs from Tidal (searches by artist/title)
+./OmniTide.py --build-local ~/Tidal\ Download --fetch-ids
+```
+
+The script reads metadata from FLAC files, extracts `ARTIST`, `TITLE`, and the custom `TIDALID` tag (if present), and writes a `song_files.txt` in the current directory.
+
+If you use `--fetch-ids`, it searches Tidal for any file missing a `TIDALID` and writes the ID back into the file **and** into the generated song file.
+
+### Fetch IDs for an existing song file
+
+If you already have a song file without IDs (e.g., an old backup), you can update it:
+
+```bash
+./OmniTide.py --fetch-ids --song-file old_backup.txt
+```
+
+This reads `old_backup.txt`, searches Tidal for every line without a `[TID:...]`, and rewrites the file with the found IDs.
 
 ---
 
-### Getting your tags right — MusicBrainz Picard
+## Backing up your Tidal playlists
 
-The sync matches songs by artist and title. If your files have missing or wrong tags, some songs may not be found or the wrong version may be added.
+The included script `Omni_List.py` exports all your user‑created playlists with track Tidal IDs.
 
-**[MusicBrainz Picard](https://picard.musicbrainz.org/)** is a free tool that fingerprints your audio files and automatically corrects their tags. It's recommended for any music library that wasn't downloaded from a streaming service.
+```bash
+./Omni_List.py > my_backup.txt
+```
 
-1. Download Picard from [picard.musicbrainz.org](https://picard.musicbrainz.org/)
-2. Drag your music folder into Picard
-3. Click **Lookup** for files that already have tags, or **Scan** to fingerprint files with missing or wrong tags
-4. Review the matches and click **Save**
-5. Run the sync — matching accuracy will be significantly better
+The output is a `song_files.txt`‑compatible file – you can later sync it to a new account instantly:
+
+```bash
+./OmniTide.py --sync --song-file my_backup.txt
+```
 
 ---
 
 ## Customising the sync
 
-Near the top of `OmniTide.py`, there are two configuration sets you can edit to fix common syncing issues.
+Near the top of `OmniTide.py` (or in the binary, you can’t edit it; use the Python version if you need this), you can set:
 
-### `SKIP_AS_ARTIST` — For mixes and compilations
-
-**What it does:** Prevents OmniTide from using the folder name as the artist when searching, but still syncs the songs.
-
-**Why you need it:** If a song file doesn't have the artist in its filename (e.g., `01 - Get Lucky.flac`), OmniTide guesses the artist from the folder name. If the folder is called `Daft Punk` this works perfectly. However, if the folder is a mix called `Workout Tracks`, OmniTide will search Tidal for a band named "Workout Tracks" and fail to find the song.
-
-Adding the folder name here tells OmniTide: *"Sync these songs, but don't assume the folder name is the artist."*
-
-```python
-# Add your mix/compilation folder names here
-SKIP_AS_ARTIST: set[str] = {"Workout Tracks", "Summer 2024", "misc"}
-```
-
-### `SKIP_PLAYLISTS` — Ignore folders entirely
-
-**What it does:** Completely skips these folders during sync.
-
-**Why you need it:** If you have folders containing audiobooks, voice memos, or playlists you've already imported and don't want touched again, add them here to save time.
-
-```python
-# OmniTide will completely ignore these folders
-SKIP_PLAYLISTS: set[str] = {"Audiobooks", "Voice Records", "My Perfect Playlist"}
-```
+- **`SKIP_AS_ARTIST`** – Folder names that should **not** be used as artist when guessing from the filename. Useful for mix folders like `Workout Tracks`.
+- **`SKIP_PLAYLISTS`** – Folder names to **completely ignore** during sync (e.g., audiobooks, voice memos).
 
 ---
 
 ## Downloading from Tidal
 
-Paste any Tidal URL for a track, album, or playlist:
+Download tracks, albums, or playlists by URL:
 
 ```bash
-# Single track
 ./OmniTide.py --download "https://tidal.com/browse/track/12345678"
-
-# Album
 ./OmniTide.py --download "https://tidal.com/browse/album/12345678"
-
-# Playlist
 ./OmniTide.py --download "https://tidal.com/browse/playlist/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
-Files are saved to `~/Tidal Download/` and organised as:
-
-```
-~/Tidal Download/
-  Tracks/
-    Artist - Title.flac
-  Albums/
-    Artist - Album Name/
-      01. Artist - Title.flac
-  Playlists/
-    Playlist Name/
-      01. Artist - Title.flac
-```
-
-Each file includes full metadata: title, artist, album artist, track number, disc number, year, ISRC, copyright, and album art.
-
-> Encrypted streams (Hi-Res / Dolby Atmos) are not supported. Standard FLAC streams work fine on all Tidal plans.
+Files are saved to `~/Tidal Download/` with full metadata, album art, and the **Tidal ID** embedded in a custom `TIDALID` tag.
 
 ---
 
-## Running sync and download together
-
-```bash
-./OmniTide.py --sync --download "https://tidal.com/browse/album/12345678"
-```
-
----
-
-## All options
+## All command‑line options
 
 | Flag | Description |
-|---|---|
+| :--- | :--- |
 | `--login` | Log in to Tidal and save your session token |
-| `--sync` | Scan Android phone and sync to Tidal playlists |
-| `--itunes` | Sync from iTunes / Apple Music library |
-| `--itunes-path PATH` | Path to iTunes Library XML (auto-detected if not provided) |
-| `--download URL` | Download a track, album, or playlist from Tidal |
-| `--only NAME` | Only sync playlists whose name contains NAME |
-| `--rescan` | Force re-scan phone even if `song_files.txt` already exists |
-| `--keep-existing` | Don't delete and replace existing same-name Tidal playlists |
+| `--sync` | Sync from your chosen source (phone or iTunes) |
+| `--source {phone,itunes}` | Source to sync from (default: phone) |
+| `--itunes` | Alias for `--source itunes` (kept for compatibility) |
+| `--itunes-path PATH` | Path to iTunes Music Library.xml |
+| `--download URL` | Download a track, album, or playlist |
+| `--only NAME` | Only sync playlists whose names contain NAME |
+| `--rescan` | Force re‑scan the source even if a song file exists |
+| `--keep-existing` | Don't delete and replace existing Tidal playlists (add to them) |
+| `--song-file FILE` | Use a custom song list file (default: `song_files.txt`) |
+| `--build-local PATH` | Scan a local music folder and build a song file with Tidal IDs |
+| `--fetch-ids` | Read a song file, search Tidal for missing IDs, and update it |
 
 ---
 
 ## Troubleshooting
 
-**Login prompt appears every run / 401 errors**
-Delete `token.json` and run `--login` again. A fresh login will be performed automatically.
+**Login prompt appears every run / 401 errors**  
+Delete `token.json` and run `--login` again. The script will automatically refresh your token on each run – if it fails, a fresh login is needed.
 
-**ADB says "no devices" or "unauthorized"**
-Make sure USB Debugging is enabled and you've accepted the authorisation prompt on your phone. Run `adb devices` to check the connection. Try unplugging and reconnecting the USB cable.
+**ADB says "no devices" or "unauthorized"**  
+Enable USB Debugging and accept the authorisation prompt on your phone. Run `adb devices` to verify the connection.
 
-**Songs not found or wrong songs added**
-Run MusicBrainz Picard on your library to fix tags before syncing. After a sync run, check `unmatched_songs.txt` for a full list of everything that wasn't found.
+**Songs not found or wrong songs added**  
+Run MusicBrainz Picard on your library to fix tags. After a sync, check `unmatched_songs.txt` for a list of everything that wasn’t found.
 
-**ffmpeg not found**
-Make sure ffmpeg is installed and on your PATH. On Linux: `sudo apt install ffmpeg` or `sudo pacman -S ffmpeg`. Downloads will still work without it but the seekbar may be broken in some players.
+**ffmpeg not found**  
+Install ffmpeg (`sudo apt install ffmpeg` on Linux, or download from ffmpeg.org). Downloads will still work without it, but the seekbar may be broken.
 
-**iTunes library not found**
-On macOS, make sure **Share iTunes Library XML** is enabled under Music → Settings → Advanced. Or pass the path manually with `--itunes-path`.
+**iTunes library not found**  
+Make sure **Share iTunes Library XML** is enabled (Music → Settings → Advanced on macOS, or Edit → Preferences → Advanced on Windows). Or use `--itunes-path`.
 
-**Venv broken after Python update**
-Delete the venv folder (`rm -rf ~/OmniTide_Env` on Linux/macOS, or delete the `OmniTide_Env` folder on Windows) and recreate it following the venv instructions above. Your `token.json` and `song_files.txt` are safe.
-
-**Download stops partway through**
-Re-run the same command. Already-downloaded files are skipped automatically so it picks up where it left off.
+**Batch adding fails with HTTP 400**  
+The script automatically falls back to individual adds for the affected chunk – no action needed. If you see many 400s, try reducing the chunk size (edit `chunk_size = 50` to a lower number in `add_tracks_batch()`).
 
 ---
 
@@ -340,3 +254,4 @@ Re-run the same command. Already-downloaded files are skipped automatically so i
 > You must have an active Tidal subscription to use this tool. Do not use OmniTide to distribute copyrighted material, bypass DRM for piracy, or violate Tidal's Terms of Service.
 >
 > The developers assume no liability for how this tool is used or any potential account bans resulting from excessive API calls. Use at your own risk.
+```
