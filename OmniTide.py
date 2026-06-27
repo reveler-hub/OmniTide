@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
 OmniTide: Phone Sync & Downloader
+
 Usage:
-  ./OmniTide.py --login                      (Log in to Tidal and save session)
-  ./OmniTide.py --sync                       (Scan phone, build Tidal playlists)
-  ./OmniTide.py --download <URL>             (Download track/album/playlist)
-  ./OmniTide.py --sync --download <URL>      (Both)
-
-song_files.txt format:
-  [Playlist Name]
-  Artist - Title
-  Artist - Title
-
-  [Another Playlist]
-  Artist - Title
+  ./OmniTide.py --login
+  ./OmniTide.py --sync [--source phone|itunes] [--song-file FILE] [--only NAME] [--keep-existing]
+  ./OmniTide.py --download <URL>
+  ./OmniTide.py --build-local <PATH> [--fetch-ids] [--song-file FILE]
+  ./OmniTide.py --fetch-ids [--song-file FILE]
 """
 
 import argparse
@@ -66,16 +60,9 @@ COVER_URL       = "https://resources.tidal.com/images/{uuid}/{size}x{size}.jpg"
 OUTPUT_BASE     = Path.home() / "Tidal Download"
 EXPLICIT_STR    = " (Explicit)"
 
-# Folder names that are compilations/playlists, not artist names.
-# Add any folder names here that shouldn't be used as the artist when
-# the filename has no "Artist - Title" separator.
 SKIP_AS_ARTIST: set[str] = set()
-
-# Playlists already on Tidal — skip during sync.
-# Add playlist names here to avoid re-importing them.
 SKIP_PLAYLISTS: set[str] = set()
 
-# iTunes system playlists to ignore
 ITUNES_SKIP_PLAYLISTS = {
     "library", "music", "downloaded", "recently added", "recently played",
     "top 25 most played", "purchases", "genius", "itunes dj", "music videos",
@@ -95,7 +82,7 @@ ITUNES_LIBRARY_PATHS = {
 }
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth (with auto‑refresh) ──────────────────────────────────────────────
 
 def _save_token(session: tidalapi.Session, token_path: Path):
     with open(token_path, "w") as f:
@@ -128,10 +115,16 @@ def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
         refresh_token = data["refresh_token"],
         expiry_time   = datetime.fromtimestamp(data["expiry_time"]),
     )
-    if not session.check_login():
-        sys.exit("❌ Session invalid. Delete token.json and re-run to login.")
 
-    _save_token(session, token_path)  # write back refreshed token
+    # ---- Auto‑refresh if token is expired or invalid ----
+    if not session.check_login():
+        print("❌ Session invalid or expired.")
+        print("🔄 Deleting token.json – please re-run with --login.")
+        token_path.unlink(missing_ok=True)
+        sys.exit(1)
+
+
+    _save_token(session, token_path)
     name = getattr(session.user, "name", None) or str(session.user.id)
     print(f"✅ Logged in as: {name}\n")
     return session, session.access_token
@@ -140,7 +133,6 @@ def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
 # ── Song list: ADB scan ───────────────────────────────────────────────────────
 
 def _clean_filename(filename: str) -> tuple[str, str]:
-    """Strip track numbers and junk tags, return (artist, title)."""
     filename = re.sub(r"^\d+[\.\-\s]+\s*", "", filename)
     filename = re.sub(r"\s*\(Explicit\)\s*$", "", filename, flags=re.IGNORECASE)
     filename = re.sub(r"\s*\(Live At[^)]*\)\s*$", "", filename, flags=re.IGNORECASE)
@@ -158,7 +150,6 @@ def _clean_folder(folder: str) -> str:
 
 
 def scan_phone_via_adb(songs_path: Path):
-    """Scan phone via ADB and write clean song_files.txt."""
     print("📱 Scanning phone via ADB...")
     try:
         result = subprocess.run(
@@ -170,78 +161,64 @@ def scan_phone_via_adb(songs_path: Path):
     except FileNotFoundError:
         sys.exit("❌ ADB not found. Install android-tools and connect your phone.")
 
-    # Parse paths into playlists
     playlists: dict[str, list[str]] = defaultdict(list)
     for line in result.stdout.splitlines():
         path = line.strip()
         if not path or Path(path).suffix.lower() not in MUSIC_EXTS:
             continue
-
         filename = Path(path).stem
         relative = path.replace(ROOT_MUSIC_PATH, "")
         parts    = relative.split("/")
         folder   = parts[0] if len(parts) > 1 else "Misc"
         playlist = _clean_folder(folder)
-
         artist, title = _clean_filename(filename)
         if not artist:
             if not any(s in folder.lower() for s in SKIP_AS_ARTIST):
                 artist = folder.split(" - ")[0].strip()
-
         entry = f"{artist} - {title}" if artist else title
         playlists[playlist].append(entry)
 
-    # Write clean format
     lines = []
     for playlist, songs in sorted(playlists.items()):
         lines.append(f"[{playlist}]")
         lines.extend(songs)
-        lines.append("")  # blank line between playlists
-
+        lines.append("")
     with open(songs_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-
     total = sum(len(v) for v in playlists.values())
     print(f"✅ Found {total} songs in {len(playlists)} playlists — saved to {songs_path}\n")
 
 
-# ── Song list: parser ─────────────────────────────────────────────────────────
+# ── Song list: parser (with Tidal ID support) ──────────────────────────────
 
-def parse_song_list(songs_path: Path) -> dict[str, list[tuple[str, str, str]]]:
-    """
-    Parse song_files.txt in section format:
-      [Playlist Name]
-      Artist - Title
-      ...
-    Returns { playlist_name: [(artist, title, display)] }
-    """
+def parse_song_list(songs_path: Path) -> dict[str, list[tuple[str, str, str, str | None]]]:
     with open(songs_path, encoding="utf-8") as f:
         lines = [l.rstrip() for l in f]
-
     playlists: dict[str, list] = defaultdict(list)
     current_playlist = "Misc"
-
     for line in lines:
         if not line.strip():
             continue
         if line.startswith("[") and line.endswith("]"):
             current_playlist = line[1:-1].strip()
             continue
-
-        # Parse "Artist - Title" or just "Title"
-        if " - " in line:
-            artist, title = line.split(" - ", 1)
+        tidal_id = None
+        base_line = line
+        match = re.search(r'\s*\[TID:([a-zA-Z0-9]+)\]\s*$', line)
+        if match:
+            tidal_id = match.group(1)
+            base_line = line[:match.start()].strip()
+        if " - " in base_line:
+            artist, title = base_line.split(" - ", 1)
             artist, title = artist.strip(), title.strip()
         else:
-            artist, title = "", line.strip()
-
+            artist, title = "", base_line.strip()
         display = f"{artist} - {title}" if artist else title
-        playlists[current_playlist].append((artist, title, display))
-
+        playlists[current_playlist].append((artist, title, display, tidal_id))
     return dict(playlists)
 
 
-# ── Tidal search & add ────────────────────────────────────────────────────────
+# ── Tidal search & add (individual, robust) ───────────────────────────────
 
 def _artist_match(artist_lower: str, track_artists: list[str]) -> bool:
     if not artist_lower:
@@ -254,35 +231,38 @@ def _title_match(title_lower: str, track_name: str) -> bool:
     return title_lower in t or t in title_lower
 
 
-def search_track(session: tidalapi.Session, artist: str, title: str, retries: int = 3):
-    query        = f"{artist} {title}" if artist else title
-    title_lower  = title.lower()
-    artist_lower = artist.lower()
+def search_track(session: tidalapi.Session, artist: str, title: str,
+                 tidal_id: str | None = None, retries: int = 3):
+    if tidal_id:
+        try:
+            track = session.track(tidal_id)
+            if track:
+                return track
+        except Exception:
+            pass
+        print(f"    ⚠️  Tidal ID {tidal_id} not found — falling back to search")
 
+    query = f"{artist} {title}" if artist else title
+    title_lower = title.lower()
+    artist_lower = artist.lower()
     for attempt in range(1, retries + 1):
         try:
             results = session.search(query, models=[tidalapi.Track], limit=10)
-            tracks  = results.get("tracks", [])
+            tracks = results.get("tracks", [])
             if not tracks:
                 return None
-
-            # Pass 1: title + artist both match
             for track in tracks:
                 ta = [a.name.lower() for a in track.artists]
                 if _title_match(title_lower, track.name) and _artist_match(artist_lower, ta):
                     return track
-
-            # Pass 2: artist matches but title is loose — warn but return
             if artist_lower:
                 for track in tracks:
                     ta = [a.name.lower() for a in track.artists]
                     if _artist_match(artist_lower, ta):
                         print(f"    ⚠️  Loose match: '{track.name}' by {', '.join(a.name for a in track.artists)}")
                         return track
-                return None  # artist known but nothing matched — don't add wrong song
-
-            return tracks[0]  # no artist info, take first result
-
+                return None
+            return tracks[0]
         except Exception as e:
             print(f"    ⚠️  Search error (attempt {attempt}/{retries}): {e}")
             if attempt < retries:
@@ -292,27 +272,89 @@ def search_track(session: tidalapi.Session, artist: str, title: str, retries: in
 
 def add_track_with_retry(session: tidalapi.Session, access_token: str, playlist,
                          track_id: int, retries: int = 3, delay: float = 5.0) -> bool:
+    """
+    Add a single track with retries.
+    If we get 401, refresh the session via check_login() and retry.
+    """
     for attempt in range(1, retries + 1):
         try:
+            # Use form data, not JSON (the API expects application/x-www-form-urlencoded)
             raw = session.request_session.post(
                 f"https://api.tidal.com/v1/playlists/{playlist.id}/items",
-                params={"sessionId": session.session_id, "countryCode": session.country_code, "limit": 100},
-                data={"onArtifactNotFound": "SKIP", "trackIds": track_id,
-                      "toIndex": playlist.num_tracks, "onDupes": "ADD"},
-                headers={"If-None-Match": "*", "Authorization": f"Bearer {access_token}"},
+                params={
+                    "sessionId": session.session_id,
+                    "countryCode": session.country_code,
+                    "limit": 100
+                },
+                data={
+                    "onArtifactNotFound": "SKIP",
+                    "trackIds": str(track_id),          # send as string, as before
+                    "toIndex": playlist.num_tracks,
+                    "onDupes": "ADD"
+                },
+                headers={
+                    "If-None-Match": "*",
+                    "Authorization": f"Bearer {access_token}"
+                },
             )
+
+            if raw.status_code == 401:
+                print("    🔄 Token expired, refreshing session...")
+                if session.check_login():
+                    access_token = session.access_token
+                    _save_token(session, TOKEN_PATH)
+                    print("    ✅ Token refreshed, retrying...")
+                    time.sleep(2)
+                    continue
+                else:
+                    print("    ❌ Failed to refresh token.")
+                    return False
+
+            if raw.status_code == 429:
+                wait = delay * 2
+                print(f"    ⚠️  Rate limited, waiting {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+
+            if raw.status_code >= 500:
+                print(f"    ⚠️  Server error {raw.status_code}, retrying...")
+                if attempt < retries:
+                    time.sleep(delay)
+                    continue
+                return False
+
             if not raw.ok:
                 print(f"    ⚠️  HTTP {raw.status_code} (attempt {attempt}/{retries})")
-                if attempt < retries: time.sleep(delay)
-                continue
-            if track_id in raw.json().get("addedItemIds", []):
+                # If we get 400, we might want to see the response body for debugging
+                if raw.status_code == 400:
+                    print(f"    ⚠️  Response body: {raw.text[:200]}")
+                if attempt < retries:
+                    time.sleep(delay)
+                    continue
+                return False
+
+            # Success
+            resp = raw.json()
+            if track_id in resp.get("addedItemIds", []):
                 playlist.num_tracks += 1
                 return True
-            print(f"    ⚠️  addedItemIds=[] (attempt {attempt}/{retries})")
-            if attempt < retries: time.sleep(delay)
+            else:
+                print(f"    ⚠️  Track {track_id} not added (already in playlist?)")
+                return False
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            print(f"    ⚠️  Network error (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(delay * 2)
+            else:
+                return False
         except Exception as e:
-            print(f"    ⚠️  Exception (attempt {attempt}/{retries}): {e}")
-            if attempt < retries: time.sleep(delay)
+            print(f"    ⚠️  Unexpected error (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                return False
+
     return False
 
 
@@ -333,7 +375,6 @@ def get_or_create_playlist(session: tidalapi.Session, name: str, keep_existing: 
     return pl
 
 
-
 # ── iTunes parser ─────────────────────────────────────────────────────────────
 
 def find_itunes_library() -> Path | None:
@@ -341,12 +382,10 @@ def find_itunes_library() -> Path | None:
     return next((p for p in candidates if p.exists()), None)
 
 
-def parse_itunes_library(xml_path: Path) -> dict[str, list[tuple[str, str, str]]]:
+def parse_itunes_library(xml_path: Path) -> dict[str, list[tuple[str, str, str, None]]]:
     print(f"📖 Reading iTunes library: {xml_path}")
     with open(xml_path, "rb") as f:
         library = plistlib.load(f)
-
-    # Build track id -> (artist, title)
     raw_tracks = library.get("Tracks", {})
     tracks: dict[str, tuple[str, str]] = {}
     for tid, info in raw_tracks.items():
@@ -357,7 +396,6 @@ def parse_itunes_library(xml_path: Path) -> dict[str, list[tuple[str, str, str]]
             continue
         tracks[tid] = (info.get("Artist", "").strip(), name)
 
-    # Build playlist -> track ids, skipping system playlists
     playlist_tracks: dict[str, list[str]] = {}
     for pl in library.get("Playlists", []):
         name = pl.get("Name", "").strip()
@@ -369,10 +407,8 @@ def parse_itunes_library(xml_path: Path) -> dict[str, list[tuple[str, str, str]]
         if items:
             playlist_tracks[name] = items
 
-    # Assign each track to its first playlist, remainder to "Music"
     seen: set[str] = set()
     playlists: dict[str, list] = defaultdict(list)
-
     for pl_name, ids in playlist_tracks.items():
         for tid in ids:
             if tid in seen:
@@ -380,24 +416,116 @@ def parse_itunes_library(xml_path: Path) -> dict[str, list[tuple[str, str, str]]
             seen.add(tid)
             artist, title = tracks[tid]
             display = f"{artist} - {title}" if artist else title
-            playlists[pl_name].append((artist, title, display))
-
+            playlists[pl_name].append((artist, title, display, None))
     for tid, (artist, title) in tracks.items():
         if tid in seen:
             continue
         display = f"{artist} - {title}" if artist else title
-        playlists["Music"].append((artist, title, display))
-
+        playlists["Music"].append((artist, title, display, None))
     total = sum(len(v) for v in playlists.values())
     print(f"✅ Found {total} tracks across {len(playlists)} playlists\n")
     return dict(playlists)
 
 
-# ── Sync engine ───────────────────────────────────────────────────────────────
+# ── Local scanner (builds song_files.txt from a local folder) ──────────────
+
+def scan_local_directory(session: tidalapi.Session | None, music_path: Path, songs_path: Path, fetch_missing: bool = False):
+    print(f"📂 Scanning local directory: {music_path}")
+    if not music_path.exists():
+        sys.exit(f"❌ Folder not found: {music_path}")
+    playlists: dict[str, list[str]] = defaultdict(list)
+    for file_path in music_path.rglob("*"):
+        if file_path.suffix.lower() not in MUSIC_EXTS:
+            continue
+        try:
+            audio = mutagen.File(file_path)
+            if audio is None:
+                continue
+            artist = audio.get("ARTIST", [""])[0] if "ARTIST" in audio else ""
+            title  = audio.get("TITLE", [""])[0]  if "TITLE"  in audio else ""
+            tidal_id = audio.get("TIDALID", [""])[0] if "TIDALID" in audio else ""
+            if not title:
+                title = file_path.stem
+            if not artist:
+                artist = "Unknown"
+            if not tidal_id and fetch_missing and session:
+                print(f"  🔍 Searching for missing ID: {artist} - {title}")
+                track = search_track(session, artist, title)
+                if track:
+                    tidal_id = str(track.id)
+                    audio["TIDALID"] = tidal_id
+                    audio.save()
+                    print(f"    ✅ Found and wrote TIDALID: {tidal_id}")
+                else:
+                    print(f"    ❌ No match found")
+                    time.sleep(0.5)
+            relative = file_path.relative_to(music_path)
+            parts = relative.parts
+            playlist_name = parts[0] if len(parts) > 1 else "Misc"
+            entry = f"{artist} - {title} [TID:{tidal_id}]" if tidal_id else f"{artist} - {title}"
+            playlists[playlist_name].append(entry)
+        except Exception as e:
+            print(f"  ⚠️  Could not read {file_path.name}: {e}")
+    lines = []
+    for playlist, songs in sorted(playlists.items()):
+        lines.append(f"[{playlist}]")
+        lines.extend(songs)
+        lines.append("")
+    with open(songs_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    total = sum(len(v) for v in playlists.values())
+    print(f"✅ Found {total} songs in {len(playlists)} playlists — saved to {songs_path}\n")
+
+
+# ── Fetch missing IDs from a song file ──────────────────────────────────────
+
+def fetch_missing_ids_for_file(session: tidalapi.Session, songs_path: Path):
+    print(f"🔍 Fetching missing Tidal IDs from {songs_path}")
+    if not songs_path.exists():
+        sys.exit(f"❌ Song file not found: {songs_path}")
+    with open(songs_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    updated_lines = []
+    modified = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("["):
+            updated_lines.append(line)
+            continue
+        if re.search(r'\[TID:[a-zA-Z0-9]+\]', stripped):
+            updated_lines.append(line)
+            continue
+        if " - " in stripped:
+            artist, title = stripped.split(" - ", 1)
+            artist, title = artist.strip(), title.strip()
+        else:
+            artist, title = "", stripped.strip()
+        print(f"  Searching: {artist} - {title}")
+        track = search_track(session, artist, title)
+        if track:
+            tidal_id = str(track.id)
+            new_line = f"{artist} - {title} [TID:{tidal_id}]\n"
+            updated_lines.append(new_line)
+            modified = True
+            print(f"    ✅ Found TID: {tidal_id}")
+        else:
+            updated_lines.append(line)
+            print(f"    ❌ No match")
+        time.sleep(0.5)
+    if modified:
+        with open(songs_path, "w", encoding="utf-8") as f:
+            f.writelines(updated_lines)
+        print(f"✅ Updated {songs_path} with new Tidal IDs.")
+    else:
+        print("✅ No missing IDs found.")
+
+
+# ── Sync engine (individual adds only) ──────────────────────────────────────
 
 def sync_library(session: tidalapi.Session, access_token: str,
                  rescan: bool, keep_existing: bool, only: str | None,
-                 source: str = "android", itunes_path: str | None = None):
+                 source: str = "phone", itunes_path: str | None = None,
+                 songs_path: Path = SONGS_PATH):
 
     if source == "itunes":
         xml_path = Path(itunes_path) if itunes_path else find_itunes_library()
@@ -405,10 +533,10 @@ def sync_library(session: tidalapi.Session, access_token: str,
             sys.exit("❌ iTunes library not found. Use --itunes-path to specify it.")
         playlists = parse_itunes_library(xml_path)
     else:
-        if not SONGS_PATH.exists() or rescan:
-            scan_phone_via_adb(SONGS_PATH)
-        print(f"📂 Reading {SONGS_PATH}...")
-        playlists = parse_song_list(SONGS_PATH)
+        if not songs_path.exists() or rescan:
+            scan_phone_via_adb(songs_path)
+        print(f"📂 Reading {songs_path}...")
+        playlists = parse_song_list(songs_path)
 
     for name in list(playlists):
         if name in SKIP_PLAYLISTS:
@@ -426,6 +554,7 @@ def sync_library(session: tidalapi.Session, access_token: str,
 
     all_unmatched   = []
     grand_matched   = grand_unmatched = grand_failed = 0
+    current_token   = access_token
 
     for playlist_name, songs in playlists.items():
         print(f"\n{'─'*55}")
@@ -434,29 +563,34 @@ def sync_library(session: tidalapi.Session, access_token: str,
 
         tidal_pl = get_or_create_playlist(session, playlist_name, keep_existing)
         matched  = unmatched = failed = added = 0
+        track_ids_to_add = []   # collect valid track IDs for batch
 
-        for i, (artist, title, display) in enumerate(songs, 1):
+        # First pass: search for all tracks, collect IDs or mark unmatched
+        for i, (artist, title, display, tidal_id) in enumerate(songs, 1):
             print(f"  [{i}/{len(songs)}] {display}")
-            track = search_track(session, artist, title)
+            track = search_track(session, artist, title, tidal_id)
             time.sleep(0.5)
-
             if not track:
                 print(f"    ❌ No match")
                 unmatched += 1
                 all_unmatched.append(f"[{playlist_name}] {display}")
                 continue
-
             matched += 1
             print(f"    🔍 {', '.join(a.name for a in track.artists)} - {track.name}")
+            track_ids_to_add.append(track.id)
 
-            if add_track_with_retry(session, access_token, tidal_pl, track.id):
-                added += 1
-                print(f"    ✅ Added ({added} so far)")
-            else:
-                failed += 1
-                print(f"    💀 Failed to add")
-
-            time.sleep(2.0)
+        # Add all found tracks in batches
+        if track_ids_to_add:
+            print(f"  ➕ Adding {len(track_ids_to_add)} tracks in batches...")
+            added_ids = add_tracks_batch(session, current_token, tidal_pl, track_ids_to_add)
+            added = len(added_ids)
+            failed = len(track_ids_to_add) - added
+            print(f"  ✅ {added} added  |  💀 {failed} failed")
+            # Update token in case it was refreshed inside batch
+            current_token = session.access_token
+        else:
+            added = 0
+            failed = 0
 
         grand_matched   += matched
         grand_unmatched += unmatched
@@ -469,12 +603,122 @@ def sync_library(session: tidalapi.Session, access_token: str,
     print(f"{'='*55}")
 
     if all_unmatched:
-        out = SONGS_PATH.parent / "unmatched_songs.txt"
+        out = songs_path.parent / "unmatched_songs.txt"
         out.write_text("\n".join(all_unmatched), encoding="utf-8")
         print(f"\n📄 Unmatched saved to: {out}")
 
+# ── Batch Upload ────────────────────────────────────────
 
-# ── Download engine ───────────────────────────────────────────────────────────
+def add_tracks_batch(session: tidalapi.Session, access_token: str, playlist,
+                     track_ids: list[int], retries: int = 3, delay: float = 5.0) -> list[int]:
+    """
+    Add multiple tracks in one API call (up to 50 per request).
+    Uses form data (not JSON). Returns list of track IDs that were actually added.
+    """
+    if not track_ids:
+        return []
+    chunk_size = 50
+    added = []
+    for i in range(0, len(track_ids), chunk_size):
+        chunk = track_ids[i:i+chunk_size]
+        ids_str = ",".join(str(tid) for tid in chunk)  # comma-separated
+        success = False
+        for attempt in range(1, retries + 1):
+            try:
+                raw = session.request_session.post(
+                    f"https://api.tidal.com/v1/playlists/{playlist.id}/items",
+                    params={
+                        "sessionId": session.session_id,
+                        "countryCode": session.country_code,
+                        "limit": 100
+                    },
+                    data={
+                        "onArtifactNotFound": "SKIP",
+                        "trackIds": ids_str,
+                        "toIndex": playlist.num_tracks,
+                        "onDupes": "ADD"
+                    },
+                    headers={
+                        "If-None-Match": "*",
+                        "Authorization": f"Bearer {access_token}"
+                    },
+                )
+
+                if raw.status_code == 401:
+                    print("    🔄 Token expired, refreshing...")
+                    if session.check_login():
+                        access_token = session.access_token
+                        _save_token(session, TOKEN_PATH)
+                        print("    ✅ Token refreshed, retrying chunk...")
+                        time.sleep(2)
+                        continue
+                    else:
+                        print("    ❌ Failed to refresh token – falling back to individual adds...")
+                        break  # break retry, go to fallback
+
+                if raw.status_code == 429:
+                    wait = delay * 2
+                    print(f"    ⚠️  Rate limited, waiting {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+
+                if raw.status_code >= 500:
+                    print(f"    ⚠️  Server error {raw.status_code}, retrying chunk...")
+                    if attempt < retries:
+                        time.sleep(delay)
+                        continue
+                    else:
+                        print("    ⤵️  Falling back to individual adds for this chunk...")
+                        break  # fallback
+
+                if raw.status_code == 400:
+                    print(f"    ⚠️  Batch 400 – falling back to individual adds for this chunk...")
+                    break  # fallback
+
+                if not raw.ok:
+                    print(f"    ⚠️  Batch HTTP {raw.status_code} (attempt {attempt}/{retries})")
+                    if attempt < retries:
+                        time.sleep(delay)
+                        continue
+                    else:
+                        print("    ⤵️  Falling back to individual adds for this chunk...")
+                        break  # fallback
+
+                # Success
+                resp = raw.json()
+                added_ids = resp.get("addedItemIds", [])
+                added.extend(added_ids)
+                playlist.num_tracks += len(added_ids)
+                success = True
+                break  # chunk done
+
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                print(f"    ⚠️  Network error (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    time.sleep(delay * 2)
+                else:
+                    print("    ⤵️  Falling back to individual adds for this chunk...")
+                    break
+            except Exception as e:
+                print(f"    ⚠️  Batch exception (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    time.sleep(delay)
+                else:
+                    print("    ⤵️  Falling back to individual adds for this chunk...")
+                    break
+
+        # If batch failed for this chunk, add individually
+        if not success:
+            for tid in chunk:
+                if add_track_with_retry(session, access_token, playlist, tid, retries=1, delay=1):
+                    added.append(tid)
+
+        time.sleep(1)  # short delay between chunks
+
+    return added
+
+
+# ── Download engine (embeds Tidal ID) ────────────────────────────────────────
 
 def explicit_tag(is_explicit: bool) -> str:
     return EXPLICIT_STR if is_explicit else ""
@@ -505,7 +749,6 @@ def _download_segments(urls: list[str], dest: pathlib.Path) -> bool:
 
 
 def _ffmpeg_remux(src: pathlib.Path, dst: pathlib.Path):
-    """Re-mux to FLAC — fixes seekbar on all players."""
     if FFmpeg is None:
         print("  ⚠️  python-ffmpeg not installed — skipping remux")
         shutil.copy2(src, dst)
@@ -525,17 +768,15 @@ def _ffmpeg_remux(src: pathlib.Path, dst: pathlib.Path):
 
 def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None):
     try:
-        m     = mutagen.flac.FLAC(str(path_file))
+        m = mutagen.flac.FLAC(str(path_file))
         album = track.album
         if not m.tags: m.add_tags()
-
         artists    = ", ".join(a.name for a in track.artists)
         alb_artist = ", ".join(
             a.name for a in album.artists
             if any("MAIN" in str(r).upper() for r in getattr(a, "roles", []))
         ) if album and hasattr(album, "artists") else artists
         if not alb_artist: alb_artist = artists
-
         m.tags["TITLE"]       = track.full_name if hasattr(track, "full_name") else track.name
         m.tags["ARTIST"]      = artists
         m.tags["ALBUMARTIST"] = alb_artist
@@ -547,7 +788,7 @@ def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None):
         m.tags["DATE"]        = str(album.release_date.year) if album and getattr(album, "release_date", None) else ""
         m.tags["ISRC"]        = getattr(track, "isrc",      "") or ""
         m.tags["COPYRIGHT"]   = getattr(track, "copyright", "") or ""
-
+        m.tags["TIDALID"] = str(track.id)
         if cover:
             pic = Picture()
             pic.type, pic.mime, pic.data = 3, "image/jpeg", cover
@@ -572,28 +813,22 @@ def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib
     except Exception as e:
         print(f"  ❌ Stream error: {e}")
         return False
-
     if manifest.is_encrypted:
         print(f"  ⚠️  Encrypted stream — skipping")
         return False
-
     dest_final.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=manifest.file_extension, delete=False) as tmp:
         tmp_path = pathlib.Path(tmp.name)
-
     print(f"  ⬇️  {full_track.name} ({len(manifest.get_urls())} segment(s))")
     if not _download_segments(manifest.get_urls(), tmp_path):
         tmp_path.unlink(missing_ok=True)
         return False
-
     print(f"  🔧 Remuxing...")
     _ffmpeg_remux(tmp_path, dest_final)
     tmp_path.unlink(missing_ok=True)
-
     if not dest_final.exists():
         print(f"  ❌ Output file not created")
         return False
-
     _embed_metadata(dest_final, full_track, cover_bytes(full_track.album) if full_track.album else None)
     print(f"  ✅ {dest_final.name}")
     time.sleep(random.uniform(2, 8))
@@ -612,14 +847,12 @@ def process_download(session: tidalapi.Session, url: str):
     media_type, media_id = parse_tidal_url(url)
     print(f"\n🔍 {media_type}  (id: {media_id})")
     print(f"📁 Output: {OUTPUT_BASE}\n")
-
     if media_type == "track":
         track = session.track(media_id, with_album=True)
         artist = sanitize(", ".join(a.name for a in track.artists))
         title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
         exp    = explicit_tag(getattr(track, "explicit", False))
         download_track(session, track, OUTPUT_BASE / "Tracks" / f"{artist} - {title}{exp}")
-
     elif media_type == "album":
         album  = session.album(media_id)
         tracks = album.tracks()
@@ -629,7 +862,6 @@ def process_download(session: tidalapi.Session, url: str):
         num_volumes = getattr(album, "num_volumes", 1) or 1
         width       = max(2, len(str(len(tracks))))
         print(f"💿 {album.name} — {len(tracks)} track(s)")
-
         for i, track in enumerate(tracks, 1):
             print(f"\n  [{i}/{len(tracks)}] {track.name}")
             disc_prefix = f"{getattr(track, 'volume_num', 1)}-" if num_volumes > 1 else ""
@@ -639,14 +871,12 @@ def process_download(session: tidalapi.Session, url: str):
             exp    = explicit_tag(getattr(track, "explicit", False))
             dest   = OUTPUT_BASE / "Albums" / f"{alb_artist} - {alb_title}{alb_exp}" / f"{num}. {artist} - {title}{exp}"
             download_track(session, track, dest)
-
     elif media_type in ("playlist", "mix"):
         playlist = session.playlist(media_id)
         items    = playlist.tracks()
         pl_name  = sanitize(playlist.name)
         width    = max(2, len(str(len(items))))
         print(f"📋 {playlist.name} — {len(items)} track(s)")
-
         for i, track in enumerate(items, 1):
             if isinstance(track, Video):
                 print(f"  [{i}] ⏭️  Skipping video")
@@ -663,18 +893,45 @@ def process_download(session: tidalapi.Session, url: str):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="OmniTide: Phone Sync & Downloader")
-    parser.add_argument("--login",         action="store_true", help="Log in to Tidal and save session token")
-    parser.add_argument("--sync",          action="store_true", help="Scan phone and sync to Tidal playlists")
-    parser.add_argument("--itunes",        action="store_true", help="Sync from iTunes/Apple Music library instead of phone")
-    parser.add_argument("--itunes-path",   type=str, metavar="PATH", help="Path to iTunes Music Library.xml (auto-detected if omitted)")
-    parser.add_argument("--download",      type=str, metavar="URL", help="Download track/album/playlist from Tidal")
-    parser.add_argument("--only",          type=str, help="Sync only playlists matching this name")
-    parser.add_argument("--rescan",        action="store_true", help="Force re-scan phone even if song_files.txt exists")
-    parser.add_argument("--keep-existing", action="store_true", help="Don't replace existing same-name playlists")
+    parser = argparse.ArgumentParser(
+        description="OmniTide: Phone Sync & Downloader",
+        epilog="For full documentation, see the comments at the top of this script."
+    )
+
+    parser.add_argument("--login", action="store_true", help="Log in to Tidal and save session token")
+
+    parser.add_argument("--sync", action="store_true",
+                        help="Sync playlists from your source (phone or iTunes) to Tidal")
+    parser.add_argument("--source", choices=["phone", "itunes"], default="phone",
+                        help="Source to sync from (phone or itunes). Default: phone")
+    parser.add_argument("--itunes", action="store_true",
+                        help="Alias for --source itunes (kept for backward compatibility)")
+    parser.add_argument("--itunes-path", type=str, metavar="PATH",
+                        help="Path to iTunes Music Library.xml (auto-detected if omitted)")
+    parser.add_argument("--only", type=str,
+                        help="Sync only playlists whose names contain this substring")
+    parser.add_argument("--rescan", action="store_true",
+                        help="Force re-scan phone even if song_files.txt exists")
+    parser.add_argument("--keep-existing", action="store_true",
+                        help="Don't replace existing same-name playlists on Tidal (add to them)")
+
+    parser.add_argument("--song-file", type=str, default="song_files.txt",
+                        help="Path to song list file (default: song_files.txt)")
+
+    parser.add_argument("--build-local", type=str, metavar="PATH",
+                        help="Scan a local music folder and build a song list file with Tidal IDs (if present)")
+    parser.add_argument("--fetch-ids", action="store_true",
+                        help="Read song file, search Tidal for missing Tidal IDs, and update the file")
+
+    parser.add_argument("--download", type=str, metavar="URL",
+                        help="Download track/album/playlist from Tidal")
+
     args = parser.parse_args()
 
-    if not any([args.login, args.sync, args.itunes, args.download]):
+    if args.itunes:
+        args.source = "itunes"
+
+    if not any([args.login, args.sync, args.download, args.build_local, args.fetch_ids]):
         parser.print_help()
         sys.exit(1)
 
@@ -684,12 +941,31 @@ def main():
         print("✅ Login complete.")
         return
 
-    if args.sync or args.itunes:
+    global SONGS_PATH
+    SONGS_PATH = Path(args.song_file)
+
+    if args.build_local:
+        scan_local_directory(
+            session if args.fetch_ids else None,
+            Path(args.build_local),
+            SONGS_PATH,
+            fetch_missing=args.fetch_ids
+        )
+        return
+
+    if args.fetch_ids:
+        fetch_missing_ids_for_file(session, SONGS_PATH)
+        return
+
+    if args.sync:
         print("\n🚀 Syncing...")
-        source = "itunes" if args.itunes else "android"
         sync_library(session, access_token,
-                     rescan=args.rescan, keep_existing=args.keep_existing, only=args.only,
-                     source=source, itunes_path=args.itunes_path)
+                     rescan=args.rescan,
+                     keep_existing=args.keep_existing,
+                     only=args.only,
+                     source=args.source,
+                     itunes_path=args.itunes_path,
+                     songs_path=SONGS_PATH)
 
     if args.download:
         print("\n🚀 Downloading...")
