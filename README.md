@@ -46,7 +46,7 @@ No third‑party sync services. Just a Tidal account.
 | :--- | :--- |
 | **Arch Linux** | `sudo pacman -S ffmpeg` |
 | **Ubuntu / Debian** | `sudo apt install ffmpeg` |
-| **Fedora** | `sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm`, then `sudo dnf install ffmpeg` — ffmpeg isn't in Fedora's default repos due to codec licensing, so RPM Fusion (free) needs enabling first |
+| **Fedora** | ffmpeg isn't in Fedora's default repos (codec licensing), so first enable RPM Fusion: `sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm` — then `sudo dnf install ffmpeg` |
 | **macOS** | `brew install ffmpeg` |
 | **Windows** | `winget install ffmpeg`, or download a build from [ffmpeg.org](https://ffmpeg.org) and add its `bin` folder to your `PATH` |
 
