@@ -1,23 +1,31 @@
-#!/usr/bin/env python3
+#!/usr/bin/env bash
+""":"
+VENV_PY="$(dirname "$0")/OmniTide_Env/bin/python3"
+if [ -x "$VENV_PY" ]; then
+    exec "$VENV_PY" "$0" "$@"
+fi
+exec python3 "$0" "$@"
+":"""
 """
 OmniTide: Phone Sync & Downloader
 
 Usage:
-  ./OmniTide.py --login
-  ./OmniTide.py --sync [--source phone|itunes] [--song-file FILE] [--only NAME] [--keep-existing]
-  ./OmniTide.py --download <URL>
-  ./OmniTide.py --build-local <PATH> [--fetch-ids] [--song-file FILE]
-  ./OmniTide.py --fetch-ids [--song-file FILE]
+  ./OmniTide.py login
+  ./OmniTide.py sync phone [--only NAME] [--cache-file FILE] [--read-tags]
+  ./OmniTide.py sync itunes [--path XML] [--only NAME] [--cache-file FILE]
+  ./OmniTide.py backup [--to {phone,itunes,folder}] [--dest DIR] [--cache-file FILE]
+  ./OmniTide.py download URL [--dest DIR]
 """
 
 import argparse
+import io
 import json
 import os
-import plistlib
-import mutagen.flac
 import pathlib
+import plistlib
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -27,12 +35,24 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from mutagen.flac import Picture
 
-import requests
-import tidalapi
-from tidalapi import Quality
-from tidalapi.media import Track, Video
+try:
+    import mutagen.flac
+    import mutagen.mp3
+    import mutagen.mp4
+    import mutagen.oggvorbis
+    from mutagen.flac import Picture
+    import requests
+    import tidalapi
+    from tidalapi import Quality
+    from tidalapi.media import Track, Video
+except ImportError as e:
+    sys.exit(
+        f"❌ Missing dependency: {e.name}\n\n"
+        "Run the setup script once to install dependencies:\n\n"
+        "  Linux/macOS:  ./setup_linux.sh\n"
+        "  Windows:      setup_windows.bat\n"
+    )
 
 try:
     from ffmpeg import FFmpeg
@@ -51,14 +71,32 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 MUSIC_EXTS      = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".wma"}
-ROOT_MUSIC_PATH = "/sdcard/Music/"
-TOKEN_PATH      = Path("token.json")
-SONGS_PATH      = Path("song_files.txt")
-FFMPEG_BIN      = "/usr/bin/ffmpeg"
-CHUNK_SIZE      = 1024 * 1024
-COVER_URL       = "https://resources.tidal.com/images/{uuid}/{size}x{size}.jpg"
-OUTPUT_BASE     = Path.home() / "Tidal Download"
-EXPLICIT_STR    = " (Explicit)"
+TAG_CLASS_BY_EXT = {
+    ".flac": mutagen.flac.FLAC,
+    ".ogg":  mutagen.oggvorbis.OggVorbis,
+    ".mp3":  mutagen.mp3.MP3,
+    ".m4a":  mutagen.mp4.MP4,
+    ".aac":  mutagen.mp4.MP4,
+}
+ROOT_MUSIC_PATH   = "/sdcard/Music/"
+TOKEN_PATH        = Path("token.json")
+PHONE_CACHE_PATH  = Path(".omnitide_phone_cache.json")
+ITUNES_CACHE_PATH = Path(".omnitide_itunes_cache.json")
+UNMATCHED_PATH    = Path("unmatched_songs.txt")
+FFMPEG_BIN        = "/usr/bin/ffmpeg"
+CHUNK_SIZE        = 1024 * 1024
+COVER_URL         = "https://resources.tidal.com/images/{uuid}/{size}x{size}.jpg"
+OUTPUT_BASE       = Path.home() / "Tidal Download"
+EXPLICIT_STR      = " (Explicit)"
+
+ITUNES_BACKUP_BASE = Path.home() / "Music" / "OmniTide Backup"
+PHONE_BACKUP_BASE  = "/sdcard/OmniTide Backup"   # sibling of /sdcard/Music, NOT inside it —
+                                                   # scan_phone_via_adb walks /sdcard/Music, so
+                                                   # backed-up files landing there would get
+                                                   # picked up by the next `sync phone` as "new"
+BACKUP_PHONE_CACHE_PATH  = Path(".omnitide_backup_phone_cache.json")
+BACKUP_ITUNES_CACHE_PATH = Path(".omnitide_backup_itunes_cache.json")
+BACKUP_FOLDER_CACHE_PATH = Path(".omnitide_backup_folder_cache.json")
 
 SKIP_AS_ARTIST: set[str] = set()
 SKIP_PLAYLISTS: set[str] = set()
@@ -109,17 +147,29 @@ def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
         data = json.load(f)
 
     session = tidalapi.Session(tidalapi.Config(quality=Quality.high_lossless))
-    session.load_oauth_session(
-        token_type    = data["token_type"],
-        access_token  = data["access_token"],
-        refresh_token = data["refresh_token"],
-        expiry_time   = datetime.fromtimestamp(data["expiry_time"]),
-    )
+
+    retries = 3
+    logged_in = False
+    for attempt in range(1, retries + 1):
+        try:
+            session.load_oauth_session(
+                token_type    = data["token_type"],
+                access_token  = data["access_token"],
+                refresh_token = data["refresh_token"],
+                expiry_time   = datetime.fromtimestamp(data["expiry_time"]),
+            )
+            logged_in = session.check_login()
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.SSLError) as e:
+            print(f"⚠️  Network error contacting Tidal (attempt {attempt}/{retries}): {e}")
+            if attempt == retries:
+                sys.exit("❌ Could not reach Tidal after several attempts. Check your connection and try again.")
+            time.sleep(3)
 
     # ---- Auto‑refresh if token is expired or invalid ----
-    if not session.check_login():
+    if not logged_in:
         print("❌ Session invalid or expired.")
-        print("🔄 Deleting token.json – please re-run with --login.")
+        print("🔄 Deleting token.json – please re-run `login`.")
         token_path.unlink(missing_ok=True)
         sys.exit(1)
 
@@ -149,7 +199,99 @@ def _clean_folder(folder: str) -> str:
     return name.strip()
 
 
-def scan_phone_via_adb(songs_path: Path):
+# ── Tag extraction (Vorbis comments, ID3, MP4) ──────────────────────────────
+
+def _extract_tags(audio) -> tuple[str, str, str]:
+    """Best-effort (artist, title, tidal_id) from a mutagen file object.
+
+    Handles Vorbis comments (FLAC/OGG), ID3 (MP3), and MP4 (M4A/AAC) tag
+    schemes, since mutagen exposes different keys per format. Missing values
+    come back as "".
+    """
+    if audio is None:
+        return "", "", ""
+
+    def first(*keys) -> str:
+        for key in keys:
+            if key not in audio:
+                continue
+            val = audio[key]
+            if hasattr(val, "text"):  # ID3 text frame
+                val = val.text
+            if isinstance(val, list):
+                return str(val[0]) if val else ""
+            return str(val)
+        return ""
+
+    artist   = first("ARTIST", "TPE1", "\xa9ART")
+    title    = first("TITLE", "TIT2", "\xa9nam")
+    tidal_id = first("TIDALID", "TXXX:TIDALID")
+    return artist, title, tidal_id
+
+
+def _read_remote_tags(remote_path: str, chunk_size: int = 2 * 1024 * 1024) -> tuple[str, str, str]:
+    """Best-effort tag read from a phone file via a partial ADB pull.
+
+    Only fetches the first chunk_size bytes (tags live near the start of the
+    file for every format we care about) instead of the whole file, then lets
+    mutagen parse that in memory. Returns ("", "", "") on any failure so
+    callers can fall back to filename parsing.
+
+    Picks the mutagen class from the file extension rather than using
+    mutagen.File()'s content-sniffing auto-detect: on a nameless, truncated
+    BytesIO buffer that auto-detect misidentifies FLAC files as MP4 and raises
+    instead of falling through, even though the bytes are perfectly valid.
+    """
+    tag_class = TAG_CLASS_BY_EXT.get(Path(remote_path).suffix.lower())
+    if tag_class is None:
+        return "", "", ""
+    proc = None
+    try:
+        proc = subprocess.Popen(["adb", "exec-out", "cat", remote_path], stdout=subprocess.PIPE)
+        data = proc.stdout.read(chunk_size)
+        if not data:
+            return "", "", ""
+        return _extract_tags(tag_class(io.BytesIO(data)))
+    except Exception:
+        return "", "", ""
+    finally:
+        if proc is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+
+
+# ── Incremental-sync cache (shared by phone/iTunes sync and backup) ─────────
+
+def load_cache(cache_path: Path) -> dict[str, dict[str, str]]:
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cache(cache_path: Path, cache: dict[str, dict[str, str]]) -> None:
+    fd, tmp_path = tempfile.mkstemp(dir=cache_path.parent, prefix=".omnitide_cache_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+
+
+def scan_phone_via_adb(read_tags: bool = False) -> dict[str, dict[str, str]]:
+    """Scans /sdcard/Music via ADB and returns {phone_path: {artist, title, tidal_id, playlist}}."""
     print("📱 Scanning phone via ADB...")
     try:
         result = subprocess.run(
@@ -161,7 +303,8 @@ def scan_phone_via_adb(songs_path: Path):
     except FileNotFoundError:
         sys.exit("❌ ADB not found. Install android-tools and connect your phone.")
 
-    playlists: dict[str, list[str]] = defaultdict(list)
+    scanned: dict[str, dict[str, str]] = {}
+    tagged = 0
     for line in result.stdout.splitlines():
         path = line.strip()
         if not path or Path(path).suffix.lower() not in MUSIC_EXTS:
@@ -171,51 +314,25 @@ def scan_phone_via_adb(songs_path: Path):
         parts    = relative.split("/")
         folder   = parts[0] if len(parts) > 1 else "Misc"
         playlist = _clean_folder(folder)
-        artist, title = _clean_filename(filename)
+
+        artist = title = tidal_id = ""
+        if read_tags:
+            artist, title, tidal_id = _read_remote_tags(path)
+        if artist and title:
+            tagged += 1
+        else:
+            f_artist, f_title = _clean_filename(filename)
+            artist, title = artist or f_artist, title or f_title
+
         if not artist:
             if not any(s in folder.lower() for s in SKIP_AS_ARTIST):
                 artist = folder.split(" - ")[0].strip()
-        entry = f"{artist} - {title}" if artist else title
-        playlists[playlist].append(entry)
 
-    lines = []
-    for playlist, songs in sorted(playlists.items()):
-        lines.append(f"[{playlist}]")
-        lines.extend(songs)
-        lines.append("")
-    with open(songs_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    total = sum(len(v) for v in playlists.values())
-    print(f"✅ Found {total} songs in {len(playlists)} playlists — saved to {songs_path}\n")
+        scanned[path] = {"artist": artist, "title": title, "tidal_id": tidal_id, "playlist": playlist}
 
-
-# ── Song list: parser (with Tidal ID support) ──────────────────────────────
-
-def parse_song_list(songs_path: Path) -> dict[str, list[tuple[str, str, str, str | None]]]:
-    with open(songs_path, encoding="utf-8") as f:
-        lines = [l.rstrip() for l in f]
-    playlists: dict[str, list] = defaultdict(list)
-    current_playlist = "Misc"
-    for line in lines:
-        if not line.strip():
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            current_playlist = line[1:-1].strip()
-            continue
-        tidal_id = None
-        base_line = line
-        match = re.search(r'\s*\[TID:([a-zA-Z0-9]+)\]\s*$', line)
-        if match:
-            tidal_id = match.group(1)
-            base_line = line[:match.start()].strip()
-        if " - " in base_line:
-            artist, title = base_line.split(" - ", 1)
-            artist, title = artist.strip(), title.strip()
-        else:
-            artist, title = "", base_line.strip()
-        display = f"{artist} - {title}" if artist else title
-        playlists[current_playlist].append((artist, title, display, tidal_id))
-    return dict(playlists)
+    tag_note = f", {tagged} via embedded tags" if read_tags else ""
+    print(f"✅ Found {len(scanned)} songs on phone{tag_note}\n")
+    return scanned
 
 
 # ── Tidal search & add (individual, robust) ───────────────────────────────
@@ -358,18 +475,29 @@ def add_track_with_retry(session: tidalapi.Session, access_token: str, playlist,
     return False
 
 
+def _find_owned_playlist(session: tidalapi.Session, name: str):
+    """Returns the caller's own playlist named `name`, or None."""
+    try:
+        for pl in session.user.playlist_and_favorite_playlists():
+            if getattr(pl, "name", None) == name and getattr(pl, "creator", None):
+                if pl.creator.id == session.user.id:
+                    return pl
+    except Exception as e:
+        print(f"    ⚠️  Could not check existing playlists: {e}")
+    return None
+
+
 def get_or_create_playlist(session: tidalapi.Session, name: str, keep_existing: bool):
-    if not keep_existing:
-        try:
-            for pl in session.user.playlist_and_favorite_playlists():
-                if getattr(pl, "name", None) == name and getattr(pl, "creator", None):
-                    if pl.creator.id == session.user.id:
-                        print(f"    ♻️  Replacing existing '{name}'")
-                        pl.delete()
-                        time.sleep(1)
-                        break
-        except Exception as e:
-            print(f"    ⚠️  Could not check existing playlists: {e}")
+    existing = _find_owned_playlist(session, name)
+
+    if existing:
+        if keep_existing:
+            print(f"    ➕ Adding to existing '{name}'")
+            return existing
+        print(f"    ♻️  Replacing existing '{name}'")
+        existing.delete()
+        time.sleep(1)
+
     pl = session.user.create_playlist(name, "")
     pl.num_tracks = 0
     return pl
@@ -382,7 +510,8 @@ def find_itunes_library() -> Path | None:
     return next((p for p in candidates if p.exists()), None)
 
 
-def parse_itunes_library(xml_path: Path) -> dict[str, list[tuple[str, str, str, None]]]:
+def parse_itunes_library(xml_path: Path) -> dict[str, dict[str, str]]:
+    """Returns {itunes_track_id: {artist, title, tidal_id: "", playlist}}."""
     print(f"📖 Reading iTunes library: {xml_path}")
     with open(xml_path, "rb") as f:
         library = plistlib.load(f)
@@ -408,204 +537,136 @@ def parse_itunes_library(xml_path: Path) -> dict[str, list[tuple[str, str, str, 
             playlist_tracks[name] = items
 
     seen: set[str] = set()
-    playlists: dict[str, list] = defaultdict(list)
+    scanned: dict[str, dict[str, str]] = {}
     for pl_name, ids in playlist_tracks.items():
         for tid in ids:
             if tid in seen:
                 continue
             seen.add(tid)
             artist, title = tracks[tid]
-            display = f"{artist} - {title}" if artist else title
-            playlists[pl_name].append((artist, title, display, None))
+            scanned[tid] = {"artist": artist, "title": title, "tidal_id": "", "playlist": pl_name}
     for tid, (artist, title) in tracks.items():
         if tid in seen:
             continue
-        display = f"{artist} - {title}" if artist else title
-        playlists["Music"].append((artist, title, display, None))
-    total = sum(len(v) for v in playlists.values())
-    print(f"✅ Found {total} tracks across {len(playlists)} playlists\n")
-    return dict(playlists)
+        scanned[tid] = {"artist": artist, "title": title, "tidal_id": "", "playlist": "Music"}
+    playlists = {r["playlist"] for r in scanned.values()}
+    print(f"✅ Found {len(scanned)} tracks across {len(playlists)} playlists\n")
+    return scanned
 
 
-# ── Local scanner (builds song_files.txt from a local folder) ──────────────
+# ── Incremental sync engine (shared by phone and iTunes sync) ───────────────
 
-def scan_local_directory(session: tidalapi.Session | None, music_path: Path, songs_path: Path, fetch_missing: bool = False):
-    print(f"📂 Scanning local directory: {music_path}")
-    if not music_path.exists():
-        sys.exit(f"❌ Folder not found: {music_path}")
-    playlists: dict[str, list[str]] = defaultdict(list)
-    for file_path in music_path.rglob("*"):
-        if file_path.suffix.lower() not in MUSIC_EXTS:
-            continue
-        try:
-            audio = mutagen.File(file_path)
-            if audio is None:
-                continue
-            artist = audio.get("ARTIST", [""])[0] if "ARTIST" in audio else ""
-            title  = audio.get("TITLE", [""])[0]  if "TITLE"  in audio else ""
-            tidal_id = audio.get("TIDALID", [""])[0] if "TIDALID" in audio else ""
-            if not title:
-                title = file_path.stem
-            if not artist:
-                artist = "Unknown"
-            if not tidal_id and fetch_missing and session:
-                print(f"  🔍 Searching for missing ID: {artist} - {title}")
-                track = search_track(session, artist, title)
-                if track:
-                    tidal_id = str(track.id)
-                    audio["TIDALID"] = tidal_id
-                    audio.save()
-                    print(f"    ✅ Found and wrote TIDALID: {tidal_id}")
-                else:
-                    print(f"    ❌ No match found")
-                    time.sleep(0.5)
-            relative = file_path.relative_to(music_path)
-            parts = relative.parts
-            playlist_name = parts[0] if len(parts) > 1 else "Misc"
-            entry = f"{artist} - {title} [TID:{tidal_id}]" if tidal_id else f"{artist} - {title}"
-            playlists[playlist_name].append(entry)
-        except Exception as e:
-            print(f"  ⚠️  Could not read {file_path.name}: {e}")
-    lines = []
-    for playlist, songs in sorted(playlists.items()):
-        lines.append(f"[{playlist}]")
-        lines.extend(songs)
-        lines.append("")
-    with open(songs_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    total = sum(len(v) for v in playlists.values())
-    print(f"✅ Found {total} songs in {len(playlists)} playlists — saved to {songs_path}\n")
+def sync_incremental(session: tidalapi.Session, access_token: str,
+                     scanned: dict[str, dict[str, str]], cache_path: Path,
+                     only: str | None, source_label: str):
+    cache = load_cache(cache_path)
 
+    def selected(playlist_name: str) -> bool:
+        if playlist_name in SKIP_PLAYLISTS:
+            return False
+        if only:
+            return only.lower() in playlist_name.lower()
+        return True
 
-# ── Fetch missing IDs from a song file ──────────────────────────────────────
+    scanned_selected = {p: r for p, r in scanned.items() if selected(r["playlist"])}
+    cache_selected    = {p: r for p, r in cache.items() if selected(r["playlist"])}
+    cache_unselected  = {p: r for p, r in cache.items() if not selected(r["playlist"])}
 
-def fetch_missing_ids_for_file(session: tidalapi.Session, songs_path: Path):
-    print(f"🔍 Fetching missing Tidal IDs from {songs_path}")
-    if not songs_path.exists():
-        sys.exit(f"❌ Song file not found: {songs_path}")
-    with open(songs_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    updated_lines = []
-    modified = False
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("["):
-            updated_lines.append(line)
-            continue
-        if re.search(r'\[TID:[a-zA-Z0-9]+\]', stripped):
-            updated_lines.append(line)
-            continue
-        if " - " in stripped:
-            artist, title = stripped.split(" - ", 1)
-            artist, title = artist.strip(), title.strip()
-        else:
-            artist, title = "", stripped.strip()
-        print(f"  Searching: {artist} - {title}")
-        track = search_track(session, artist, title)
-        if track:
-            tidal_id = str(track.id)
-            new_line = f"{artist} - {title} [TID:{tidal_id}]\n"
-            updated_lines.append(new_line)
-            modified = True
-            print(f"    ✅ Found TID: {tidal_id}")
-        else:
-            updated_lines.append(line)
-            print(f"    ❌ No match")
-        time.sleep(0.5)
-    if modified:
-        with open(songs_path, "w", encoding="utf-8") as f:
-            f.writelines(updated_lines)
-        print(f"✅ Updated {songs_path} with new Tidal IDs.")
-    else:
-        print("✅ No missing IDs found.")
+    if only and not scanned_selected and not cache_selected:
+        print(f"❌ No playlists matching '{only}'")
+        return
 
+    new, unchanged, removed = diff_scan(scanned_selected, cache_selected)
 
-# ── Sync engine (individual adds only) ──────────────────────────────────────
+    new_by_playlist: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for item_id, rec in new.items():
+        new_by_playlist[rec["playlist"]].append((item_id, rec))
 
-def sync_library(session: tidalapi.Session, access_token: str,
-                 rescan: bool, keep_existing: bool, only: str | None,
-                 source: str = "phone", itunes_path: str | None = None,
-                 songs_path: Path = SONGS_PATH):
+    removed_by_playlist: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for item_id, rec in removed.items():
+        removed_by_playlist[rec["playlist"]].append((item_id, rec))
 
-    if source == "itunes":
-        xml_path = Path(itunes_path) if itunes_path else find_itunes_library()
-        if not xml_path or not xml_path.exists():
-            sys.exit("❌ iTunes library not found. Use --itunes-path to specify it.")
-        playlists = parse_itunes_library(xml_path)
-    else:
-        if not songs_path.exists() or rescan:
-            scan_phone_via_adb(songs_path)
-        print(f"📂 Reading {songs_path}...")
-        playlists = parse_song_list(songs_path)
+    final_cache = {**cache_unselected, **unchanged}
 
-    for name in list(playlists):
-        if name in SKIP_PLAYLISTS:
-            print(f"⏭️  Skipping '{name}'")
-            del playlists[name]
+    playlist_names = sorted(set(new_by_playlist) | set(removed_by_playlist))
+    if not playlist_names:
+        print("✅ Nothing changed since the last scan.\n")
+        save_cache(cache_path, final_cache)
+        return
 
-    if only:
-        playlists = {k: v for k, v in playlists.items() if only.lower() in k.lower()}
-        if not playlists:
-            print(f"❌ No playlists matching '{only}'")
-            return
+    all_unmatched = []
+    current_token = access_token
 
-    total = sum(len(v) for v in playlists.values())
-    print(f"📋 {len(playlists)} playlists, {total} songs\n")
+    for playlist_name in playlist_names:
+        new_entries = new_by_playlist.get(playlist_name, [])
+        removed_entries = removed_by_playlist.get(playlist_name, [])
 
-    all_unmatched   = []
-    grand_matched   = grand_unmatched = grand_failed = 0
-    current_token   = access_token
-
-    for playlist_name, songs in playlists.items():
         print(f"\n{'─'*55}")
-        print(f"🎵  '{playlist_name}'  ({len(songs)} songs)")
+        print(f"🎵  '{playlist_name}'  (+{len(new_entries)} new, -{len(removed_entries)} gone)")
         print(f"{'─'*55}")
 
-        tidal_pl = get_or_create_playlist(session, playlist_name, keep_existing)
-        matched  = unmatched = failed = added = 0
-        track_ids_to_add = []   # collect valid track IDs for batch
+        if new_entries:
+            tidal_pl = get_or_create_playlist(session, playlist_name, keep_existing=True)
+            track_ids_to_add = []
+            item_by_track_id = {}
+            for i, (item_id, rec) in enumerate(new_entries, 1):
+                display = f"{rec['artist']} - {rec['title']}" if rec["artist"] else rec["title"]
+                print(f"  [{i}/{len(new_entries)}] {display}")
+                track = search_track(session, rec["artist"], rec["title"], rec["tidal_id"] or None)
+                time.sleep(0.5)
+                if not track:
+                    print(f"    ❌ No match")
+                    all_unmatched.append(f"[{source_label}] [{playlist_name}] {display}")
+                    continue
+                print(f"    🔍 {', '.join(a.name for a in track.artists)} - {track.name}")
+                track_ids_to_add.append(track.id)
+                item_by_track_id[track.id] = (item_id, rec)
 
-        # First pass: search for all tracks, collect IDs or mark unmatched
-        for i, (artist, title, display, tidal_id) in enumerate(songs, 1):
-            print(f"  [{i}/{len(songs)}] {display}")
-            track = search_track(session, artist, title, tidal_id)
-            time.sleep(0.5)
-            if not track:
-                print(f"    ❌ No match")
-                unmatched += 1
-                all_unmatched.append(f"[{playlist_name}] {display}")
-                continue
-            matched += 1
-            print(f"    🔍 {', '.join(a.name for a in track.artists)} - {track.name}")
-            track_ids_to_add.append(track.id)
+            if track_ids_to_add:
+                print(f"  ➕ Adding {len(track_ids_to_add)} tracks in batches...")
+                added_ids = add_tracks_batch(session, current_token, tidal_pl, track_ids_to_add)
+                print(f"  ✅ {len(added_ids)} added  |  💀 {len(track_ids_to_add) - len(added_ids)} failed")
+                current_token = session.access_token
+                for tid in added_ids:
+                    item_id, rec = item_by_track_id[tid]
+                    final_cache[item_id] = {**rec, "tidal_id": str(tid)}
 
-        # Add all found tracks in batches
-        if track_ids_to_add:
-            print(f"  ➕ Adding {len(track_ids_to_add)} tracks in batches...")
-            added_ids = add_tracks_batch(session, current_token, tidal_pl, track_ids_to_add)
-            added = len(added_ids)
-            failed = len(track_ids_to_add) - added
-            print(f"  ✅ {added} added  |  💀 {failed} failed")
-            # Update token in case it was refreshed inside batch
-            current_token = session.access_token
-        else:
-            added = 0
-            failed = 0
+        if removed_entries:
+            tidal_pl = _find_owned_playlist(session, playlist_name)
+            if tidal_pl and confirm_removal(source_label, playlist_name, len(removed_entries)):
+                ids_to_remove = [rec["tidal_id"] for _, rec in removed_entries if rec.get("tidal_id")]
+                if ids_to_remove:
+                    remove_tracks_from_playlist(tidal_pl, ids_to_remove)
+                    print(f"    🗑️  Removed {len(ids_to_remove)} track(s) from '{playlist_name}'")
+                    if len(tidal_pl.tracks()) == 0:
+                        tidal_pl.delete()
+                        print(f"    🗑️  '{playlist_name}' is now empty — deleted from Tidal")
+            # Either way, these items are gone from the source and drop out of the cache below.
 
-        grand_matched   += matched
-        grand_unmatched += unmatched
-        grand_failed    += failed
-        print(f"\n  ✅ {added} added  |  ❌ {unmatched} not found  |  💀 {failed} failed")
-
-    print(f"\n{'='*55}")
-    print(f"  DONE — {len(playlists)} playlists")
-    print(f"  ✅ Matched: {grand_matched}  ❌ Not found: {grand_unmatched}  💀 Failed: {grand_failed}")
-    print(f"{'='*55}")
+    save_cache(cache_path, final_cache)
 
     if all_unmatched:
-        out = songs_path.parent / "unmatched_songs.txt"
-        out.write_text("\n".join(all_unmatched), encoding="utf-8")
-        print(f"\n📄 Unmatched saved to: {out}")
+        UNMATCHED_PATH.write_text("\n".join(all_unmatched), encoding="utf-8")
+        print(f"\n📄 Unmatched saved to: {UNMATCHED_PATH}")
+
+    print(f"\n{'='*55}")
+    print(f"  DONE — {len(new)} new  {len(removed)} gone  {len(unchanged)} unchanged")
+    print(f"{'='*55}")
+
+
+def sync_phone(session: tidalapi.Session, access_token: str,
+              only: str | None, read_tags: bool, cache_path: Path):
+    scanned = scan_phone_via_adb(read_tags=read_tags)
+    sync_incremental(session, access_token, scanned, cache_path, only, source_label="phone")
+
+
+def sync_itunes(session: tidalapi.Session, access_token: str,
+                only: str | None, itunes_path: str | None, cache_path: Path):
+    xml_path = Path(itunes_path) if itunes_path else find_itunes_library()
+    if not xml_path or not xml_path.exists():
+        sys.exit("❌ iTunes library not found. Use --path to specify it.")
+    scanned = parse_itunes_library(xml_path)
+    sync_incremental(session, access_token, scanned, cache_path, only, source_label="iTunes")
 
 # ── Batch Upload ────────────────────────────────────────
 
@@ -716,6 +777,47 @@ def add_tracks_batch(session: tidalapi.Session, access_token: str, playlist,
         time.sleep(1)  # short delay between chunks
 
     return added
+
+
+# ── Diff & removal helpers (used by sync_incremental) ───────────────────────
+
+def diff_scan(scanned: dict[str, dict[str, str]],
+              cache: dict[str, dict[str, str]]) -> tuple[dict, dict, dict]:
+    """Returns (new, unchanged, removed) — each a {item_id: record} subset.
+
+    "unchanged" keeps the cache's record (it already has a resolved tidal_id
+    from a previous successful match) rather than the fresh scan's record —
+    a plain rescan never re-resolves IDs on its own, so using the scanned
+    record here would silently wipe out IDs already known to be correct. The
+    one case where the fresh scan wins is when it found a tidal_id (e.g. via
+    --read-tags on a phone rescan) that the cache didn't have yet.
+    """
+    new = {p: r for p, r in scanned.items() if p not in cache}
+    unchanged = {}
+    for p, cached_rec in cache.items():
+        if p not in scanned:
+            continue
+        merged = dict(cached_rec)
+        if not merged.get("tidal_id") and scanned[p].get("tidal_id"):
+            merged["tidal_id"] = scanned[p]["tidal_id"]
+        unchanged[p] = merged
+    removed = {p: r for p, r in cache.items() if p not in scanned}
+    return new, unchanged, removed
+
+
+def confirm_removal(source_label: str, playlist_name: str, count: int) -> bool:
+    if not sys.stdin.isatty():
+        print(f"    ⚠️  {count} track(s) gone from {source_label} for '{playlist_name}' — "
+              f"not removing from Tidal (no interactive terminal to confirm).")
+        return False
+    answer = input(f"    {count} track(s) gone from {source_label} for '{playlist_name}'. "
+                   f"Remove them from the Tidal playlist too? [y/N] ").strip().lower()
+    return answer == "y"
+
+
+def remove_tracks_from_playlist(playlist, track_ids: list[str]) -> bool:
+    return playlist.delete_by_id([str(t) for t in track_ids])
+
 
 
 # ── Download engine (embeds Tidal ID) ────────────────────────────────────────
@@ -890,88 +992,288 @@ def process_download(session: tidalapi.Session, url: str):
         sys.exit(f"❌ Unsupported type: {media_type}")
 
 
+# ── Backup: download the whole Tidal account ─────────────────────────────────
+
+def _iter_owned_playlists(session: tidalapi.Session):
+    """Yields every playlist owned by the logged-in user, paginating past
+    Tidal's 50-per-page cap on playlist_and_favorite_playlists()."""
+    offset, limit = 0, 50
+    while True:
+        page = session.user.playlist_and_favorite_playlists(offset=offset, limit=limit)
+        if not page:
+            return
+        for pl in page:
+            if getattr(pl, "creator", None) and pl.creator.id == session.user.id:
+                yield pl
+        if len(page) < limit:
+            return
+        offset += limit
+
+
+def push_to_phone(local_path: pathlib.Path, remote_path: str) -> bool:
+    """adb-pushes local_path to remote_path, creating the remote parent dir first.
+
+    remote_path is passed through `adb shell` as part of a reconstructed remote
+    command line, so its directory needs shlex.quote(); adb push's own two argv
+    items never go through a remote shell, so they need no quoting at all.
+    """
+    remote_dir = remote_path.rsplit("/", 1)[0] if "/" in remote_path else "."
+    try:
+        mkdir = subprocess.run(
+            ["adb", "shell", f"mkdir -p {shlex.quote(remote_dir)}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if mkdir.returncode != 0:
+            print(f"  ❌ adb mkdir failed for {remote_dir}: {mkdir.stderr.strip()}")
+            return False
+        push = subprocess.run(
+            ["adb", "push", str(local_path), remote_path],
+            capture_output=True, text=True, timeout=300,
+        )
+        if push.returncode != 0:
+            print(f"  ❌ adb push failed for {remote_path}: {push.stderr.strip()}")
+            return False
+        return True
+    except FileNotFoundError:
+        sys.exit("❌ ADB not found. Install android-tools and connect your phone.")
+
+
+def _deliver_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path,
+                   destination: str, remote_no_ext: str | None = None) -> bool:
+    """Downloads one track and delivers it to the chosen destination.
+
+    'itunes'/'folder': a plain download_track() call. 'phone': downloads to a
+    local temp path, adb-pushes it, then deletes the local copy immediately —
+    never stages more than one track's worth of local disk at a time.
+    """
+    if destination != "phone":
+        return download_track(session, track, dest_no_ext)
+    if not download_track(session, track, dest_no_ext):
+        return False
+    local_final = pathlib.Path(str(dest_no_ext) + ".flac")
+    delivered = push_to_phone(local_final, remote_no_ext + ".flac")
+    local_final.unlink(missing_ok=True)
+    return delivered
+
+
+def backup_tidal(session: tidalapi.Session, destination: str,
+                 dest_path: Path | None, cache_path: Path) -> None:
+    """Downloads every owned playlist + Liked Songs to the chosen destination.
+
+    Liked tracks are intentionally NOT deduped against playlist tracks — a
+    track that's both liked and in a playlist is delivered to both, since
+    liking is its own signal independent of playlist membership. Cache keys
+    are scoped per-playlist/per-liked (not bare track IDs) specifically to
+    support this — a bare-ID cache would deliver a shared track once and
+    incorrectly skip it the second time.
+
+    Incremental only in the "what's new" direction — if a track is unfavorited
+    or removed from a playlist on Tidal after being backed up, the local/phone
+    copy and its cache entry are left untouched. Deliberate scope boundary.
+    """
+    cache = load_cache(cache_path)
+
+    if destination == "phone":
+        base = PHONE_BACKUP_BASE
+    elif destination == "itunes":
+        base = str(dest_path) if dest_path else str(ITUNES_BACKUP_BASE)
+    else:
+        base = str(dest_path) if dest_path else str(Path.cwd())
+
+    tmp_dir_ctx = tempfile.TemporaryDirectory(prefix="omnitide_backup_") if destination == "phone" else None
+    tmp_dir = Path(tmp_dir_ctx.name) if tmp_dir_ctx else None
+
+    def deliver(track: Track, local_rel: pathlib.Path, remote_rel: str) -> bool:
+        if destination == "phone":
+            local_dest  = tmp_dir / str(track.id)
+            remote_dest = f"{base}/{remote_rel}"
+            return _deliver_track(session, track, local_dest, "phone", remote_dest)
+        return _deliver_track(session, track, Path(base) / local_rel, destination)
+
+    delivered_count = skipped_count = 0
+    try:
+        print("📋 Enumerating owned playlists...")
+        playlists = list(_iter_owned_playlists(session))
+        print(f"✅ Found {len(playlists)} owned playlist(s)\n")
+
+        for pl in playlists:
+            print(f"\n{'─'*55}")
+            print(f"🎵  '{pl.name}'")
+            print(f"{'─'*55}")
+            tracks = pl.tracks_paginated()
+            width = max(2, len(str(len(tracks))))
+            for i, track in enumerate(tracks, 1):
+                if isinstance(track, Video):
+                    continue
+                scope = f"playlist::{pl.name}"
+                key = f"{scope}::{track.id}"
+                if key in cache:
+                    skipped_count += 1
+                    continue
+                artist = sanitize(", ".join(a.name for a in track.artists))
+                title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
+                fname  = f"{str(i).zfill(width)}. {artist} - {title}"
+                print(f"  [{i}/{len(tracks)}] {artist} - {title}")
+                local_rel  = pathlib.Path("Playlists") / sanitize(pl.name) / fname
+                remote_rel = f"Playlists/{sanitize(pl.name)}/{fname}"
+                if deliver(track, local_rel, remote_rel):
+                    cache[key] = {"tidal_id": str(track.id), "artist": artist, "title": title, "playlist": scope}
+                    save_cache(cache_path, cache)
+                    delivered_count += 1
+
+        print(f"\n{'─'*55}")
+        print(f"💛  Liked Songs")
+        print(f"{'─'*55}")
+        liked = session.user.favorites.tracks_paginated()
+        print(f"✅ Found {len(liked)} liked track(s)\n")
+        for i, track in enumerate(liked, 1):
+            scope = "liked"
+            key = f"{scope}::{track.id}"
+            if key in cache:
+                skipped_count += 1
+                continue
+            artist = sanitize(", ".join(a.name for a in track.artists))
+            title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
+            exp    = explicit_tag(getattr(track, "explicit", False))
+            fname  = f"{artist} - {title}{exp}"
+            print(f"  [{i}/{len(liked)}] {artist} - {title}")
+            local_rel  = pathlib.Path("Liked Songs") / fname
+            remote_rel = f"Liked Songs/{fname}"
+            if deliver(track, local_rel, remote_rel):
+                cache[key] = {"tidal_id": str(track.id), "artist": artist, "title": title, "playlist": scope}
+                save_cache(cache_path, cache)
+                delivered_count += 1
+    finally:
+        if tmp_dir_ctx:
+            tmp_dir_ctx.cleanup()
+
+    print(f"\n{'='*55}")
+    print(f"  DONE — {delivered_count} delivered, {skipped_count} already backed up")
+    print(f"{'='*55}")
+
+
+def prompt_destination() -> str:
+    if not sys.stdin.isatty():
+        sys.exit("❌ Not running interactively — pass --to {phone,itunes,folder} to skip the prompt.")
+    print("Where should OmniTide back up your Tidal library to?")
+    print("  1) Phone (adb push)")
+    print("  2) iTunes folder")
+    print("  3) Current folder")
+    for _ in range(3):
+        choice = input("Choose [1/2/3]: ").strip()
+        dest = {"1": "phone", "2": "itunes", "3": "folder"}.get(choice)
+        if dest:
+            return dest
+        print("  ⚠️  Please enter 1, 2, or 3.")
+    sys.exit("❌ No valid selection after 3 attempts.")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="OmniTide",
         description="OmniTide: Phone Sync & Downloader",
-        epilog="For full documentation, see the comments at the top of this script."
     )
+    commands = parser.add_subparsers(dest="command")
 
-    parser.add_argument("--login", action="store_true", help="Log in to Tidal and save session token")
+    commands.add_parser("login", help="Log in to Tidal and save your session token")
 
-    parser.add_argument("--sync", action="store_true",
-                        help="Sync playlists from your source (phone or iTunes) to Tidal")
-    parser.add_argument("--source", choices=["phone", "itunes"], default="phone",
-                        help="Source to sync from (phone or itunes). Default: phone")
-    parser.add_argument("--itunes", action="store_true",
-                        help="Alias for --source itunes (kept for backward compatibility)")
-    parser.add_argument("--itunes-path", type=str, metavar="PATH",
-                        help="Path to iTunes Music Library.xml (auto-detected if omitted)")
-    parser.add_argument("--only", type=str,
-                        help="Sync only playlists whose names contain this substring")
-    parser.add_argument("--rescan", action="store_true",
-                        help="Force re-scan phone even if song_files.txt exists")
-    parser.add_argument("--keep-existing", action="store_true",
-                        help="Don't replace existing same-name playlists on Tidal (add to them)")
+    sync_common = argparse.ArgumentParser(add_help=False)
+    sync_common.add_argument("--only", type=str,
+                             help="Sync only playlists whose names contain this substring")
 
-    parser.add_argument("--song-file", type=str, default="song_files.txt",
-                        help="Path to song list file (default: song_files.txt)")
+    sync_parser = commands.add_parser("sync", help="Sync a music library to Tidal")
+    sync_sources = sync_parser.add_subparsers(dest="source", required=True)
 
-    parser.add_argument("--build-local", type=str, metavar="PATH",
-                        help="Scan a local music folder and build a song list file with Tidal IDs (if present)")
-    parser.add_argument("--fetch-ids", action="store_true",
-                        help="Read song file, search Tidal for missing Tidal IDs, and update the file")
+    phone_parser = sync_sources.add_parser("phone", parents=[sync_common],
+                                           help="Sync from an Android phone over ADB")
+    phone_parser.add_argument("--cache-file", type=str, default=None, metavar="FILE",
+                              help=f"Where to store the incremental phone-scan cache "
+                                   f"(default: {PHONE_CACHE_PATH})")
+    phone_parser.add_argument("--read-tags", action="store_true",
+                              help="Read ARTIST/TITLE/TIDALID from each file's embedded tags instead of "
+                                   "guessing from the filename (more accurate, slower — pulls a chunk of "
+                                   "every file over ADB)")
 
-    parser.add_argument("--download", type=str, metavar="URL",
-                        help="Download track/album/playlist from Tidal")
+    itunes_parser = sync_sources.add_parser("itunes", parents=[sync_common],
+                                            help="Sync from an iTunes/Apple Music library")
+    itunes_parser.add_argument("--path", type=str, metavar="XML",
+                               help="Path to iTunes Music Library.xml (auto-detected if omitted)")
+    itunes_parser.add_argument("--cache-file", type=str, default=None, metavar="FILE",
+                               help=f"Where to store the incremental iTunes-scan cache "
+                                    f"(default: {ITUNES_CACHE_PATH})")
 
+    download_parser = commands.add_parser("download", help="Download a track, album, or playlist from Tidal")
+    download_parser.add_argument("url", type=str, help="Tidal track/album/playlist URL")
+    download_parser.add_argument("--dest", type=str, metavar="DIR",
+                                 help=f"Output directory (default: {OUTPUT_BASE})")
+
+    backup_parser = commands.add_parser("backup",
+        help="Download your entire Tidal account (owned playlists + Liked Songs) to Phone/iTunes-folder/current folder")
+    backup_parser.add_argument("--to", choices=["phone", "itunes", "folder"], default=None,
+                               help="Destination to back up to; skips the interactive prompt "
+                                    "(required when not running interactively)")
+    backup_parser.add_argument("--dest", type=str, metavar="DIR", default=None,
+                               help="Override the destination folder for 'itunes'/'folder' backups "
+                                    f"(defaults: iTunes → {ITUNES_BACKUP_BASE}, folder → current directory; "
+                                    "ignored for --to phone)")
+    backup_parser.add_argument("--cache-file", type=str, default=None, metavar="FILE",
+                               help="Where to store the incremental backup-delivery cache "
+                                    "(default depends on --to: .omnitide_backup_{phone,itunes,folder}_cache.json)")
+
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
 
-    if args.itunes:
-        args.source = "itunes"
-
-    if not any([args.login, args.sync, args.download, args.build_local, args.fetch_ids]):
+    if not args.command:
         parser.print_help()
         sys.exit(1)
 
     session, access_token = load_session(TOKEN_PATH)
 
-    if args.login:
+    if args.command == "login":
         print("✅ Login complete.")
         return
 
-    global SONGS_PATH
-    SONGS_PATH = Path(args.song_file)
-
-    if args.build_local:
-        scan_local_directory(
-            session if args.fetch_ids else None,
-            Path(args.build_local),
-            SONGS_PATH,
-            fetch_missing=args.fetch_ids
-        )
-        return
-
-    if args.fetch_ids:
-        fetch_missing_ids_for_file(session, SONGS_PATH)
-        return
-
-    if args.sync:
+    if args.command == "sync":
         print("\n🚀 Syncing...")
-        sync_library(session, access_token,
-                     rescan=args.rescan,
-                     keep_existing=args.keep_existing,
-                     only=args.only,
-                     source=args.source,
-                     itunes_path=args.itunes_path,
-                     songs_path=SONGS_PATH)
+        if args.source == "phone":
+            sync_phone(session, access_token,
+                      only=args.only,
+                      read_tags=args.read_tags,
+                      cache_path=Path(args.cache_file) if args.cache_file else PHONE_CACHE_PATH)
+        elif args.source == "itunes":
+            sync_itunes(session, access_token,
+                       only=args.only,
+                       itunes_path=args.path,
+                       cache_path=Path(args.cache_file) if args.cache_file else ITUNES_CACHE_PATH)
+        print("\n✨ Done.")
+        return
 
-    if args.download:
+    if args.command == "download":
+        if args.dest:
+            global OUTPUT_BASE
+            OUTPUT_BASE = Path(args.dest)
         print("\n🚀 Downloading...")
-        process_download(session, args.download)
+        process_download(session, args.url)
+        print("\n✨ Done.")
+        return
 
-    print("\n✨ Done.")
+    if args.command == "backup":
+        destination = args.to or prompt_destination()
+        cache_default = {"phone": BACKUP_PHONE_CACHE_PATH,
+                         "itunes": BACKUP_ITUNES_CACHE_PATH,
+                         "folder": BACKUP_FOLDER_CACHE_PATH}[destination]
+        print("\n🚀 Backing up your Tidal account...")
+        backup_tidal(session, destination,
+                    dest_path=Path(args.dest) if args.dest else None,
+                    cache_path=Path(args.cache_file) if args.cache_file else cache_default)
+        print("\n✨ Done.")
+        return
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+OmniTide_Env/
+__pycache__/
+*.pyc
+token.json
+unmatched_songs.txt
+.omnitide_phone_cache.json
