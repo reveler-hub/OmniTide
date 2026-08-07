@@ -31,8 +31,36 @@ No third‑party sync services. Just a Tidal account.
 - A Tidal account (any plan)
 - Python 3.10 or newer
 - `ffmpeg` installed on your system
-- For Android sync: ADB (Android Debug Bridge)
+- For Android sync/backup: ADB (Android Debug Bridge)
 - For iTunes sync: iTunes with XML sharing enabled
+
+---
+
+## Installing ffmpeg and ADB
+
+`ffmpeg` remuxes downloaded tracks (used by `download` and `backup`). ADB is only needed for `sync phone` and `backup --to phone`. Neither is required for `sync itunes` or logging in.
+
+### ffmpeg
+
+| OS | Command |
+| :--- | :--- |
+| **Arch Linux** | `sudo pacman -S ffmpeg` |
+| **Ubuntu / Debian** | `sudo apt install ffmpeg` |
+| **Fedora** | `sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm`, then `sudo dnf install ffmpeg` — ffmpeg isn't in Fedora's default repos due to codec licensing, so RPM Fusion (free) needs enabling first |
+| **macOS** | `brew install ffmpeg` |
+| **Windows** | `winget install ffmpeg`, or download a build from [ffmpeg.org](https://ffmpeg.org) and add its `bin` folder to your `PATH` |
+
+### ADB (Android Debug Bridge)
+
+| OS | Command |
+| :--- | :--- |
+| **Arch Linux** | `sudo pacman -S android-tools` |
+| **Ubuntu / Debian** | `sudo apt install android-tools-adb` |
+| **Fedora** | `sudo dnf install android-tools` |
+| **macOS** | `brew install android-platform-tools` |
+| **Windows** | `winget install Google.PlatformTools`, or download [SDK Platform Tools](https://developer.android.com/tools/releases/platform-tools) and add it to your `PATH` |
+
+Verify either install with `ffmpeg -version` / `adb version`.
 
 ---
 
@@ -219,7 +247,7 @@ Run `./OmniTide.py <command> --help` for a command's full option list, or `./Omn
 Delete `token.json` and run `login` again. The script will automatically refresh your token on each run – if it fails, a fresh login is needed.
 
 **ADB says "no devices" or "unauthorized"**  
-Enable USB Debugging and accept the authorisation prompt on your phone. Run `adb devices` to verify the connection.
+Enable USB Debugging and accept the authorisation prompt on your phone. Run `adb devices` to verify the connection. If `adb` isn't found at all, see "Installing ffmpeg and ADB" above.
 
 **Songs not found or wrong songs added**  
 Run MusicBrainz Picard on your library to fix tags. After a sync, check `unmatched_songs.txt` for a list of everything that wasn't found — unmatched songs aren't cached, so they're retried automatically on your next run. For phone sync specifically, try `sync phone --read-tags` — matching from embedded tags is more accurate than guessing from filenames.
@@ -234,7 +262,7 @@ Backup tracks what it's already delivered in `.omnitide_backup_{phone,itunes,fol
 Expected, not a bug — if a track is both in a playlist and in your Liked Songs, it's downloaded to both `Playlists/<name>/` and `Liked Songs/` on purpose (see "Backing up your whole Tidal account" above).
 
 **ffmpeg not found**  
-Install ffmpeg — `sudo apt install ffmpeg` on Linux, `brew install ffmpeg` on macOS, or on Windows `winget install ffmpeg` (or download a build from ffmpeg.org and add its `bin` folder to your `PATH`). Downloads will still work without it, but the seekbar may be broken.
+See "Installing ffmpeg and ADB" above. Downloads will still work without it, but the seekbar may be broken.
 
 **iTunes library not found**  
 Make sure **Share iTunes Library XML** is enabled (Music → Settings → Advanced on macOS, or Edit → Preferences → Advanced on Windows). Or use `--path`.
