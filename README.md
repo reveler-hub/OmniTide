@@ -262,7 +262,7 @@ Backup tracks what it's already delivered in `.omnitide_backup_{phone,itunes,fol
 Expected, not a bug — if a track is both in a playlist and in your Liked Songs, it's downloaded to both `Playlists/<name>/` and `Liked Songs/` on purpose (see "Backing up your whole Tidal account" above).
 
 **ffmpeg not found**  
-See "Installing ffmpeg and ADB" above. Downloads will still work without it, but the seekbar may be broken.
+`download` and `backup` exit immediately with this error since both need ffmpeg to remux tracks. See "Installing ffmpeg and ADB" above, then confirm `ffmpeg -version` works from a terminal.
 
 **iTunes library not found**  
 Make sure **Share iTunes Library XML** is enabled (Music → Settings → Advanced on macOS, or Edit → Preferences → Advanced on Windows). Or use `--path`.

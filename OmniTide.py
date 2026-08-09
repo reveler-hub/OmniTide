@@ -27,6 +27,7 @@ import random
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -83,7 +84,7 @@ TOKEN_PATH        = Path("token.json")
 PHONE_CACHE_PATH  = Path(".omnitide_phone_cache.json")
 ITUNES_CACHE_PATH = Path(".omnitide_itunes_cache.json")
 UNMATCHED_PATH    = Path("unmatched_songs.txt")
-FFMPEG_BIN        = "/usr/bin/ffmpeg"
+FFMPEG_BIN        = shutil.which("ffmpeg") or "ffmpeg"
 CHUNK_SIZE        = 1024 * 1024
 COVER_URL         = "https://resources.tidal.com/images/{uuid}/{size}x{size}.jpg"
 OUTPUT_BASE       = Path.home() / "Tidal Download"
@@ -130,6 +131,8 @@ def _save_token(session: tidalapi.Session, token_path: Path):
             "refresh_token": session.refresh_token,
             "expiry_time":   session.expiry_time.timestamp() if session.expiry_time else 0.0,
         }, f, indent=4)
+    if os.name != "nt":
+        os.chmod(token_path, stat.S_IRUSR | stat.S_IWUSR)
 
 
 def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
@@ -850,6 +853,15 @@ def _download_segments(urls: list[str], dest: pathlib.Path) -> bool:
         return False
 
 
+def _require_ffmpeg():
+    if FFmpeg is None or shutil.which("ffmpeg") is None:
+        sys.exit(
+            "❌ ffmpeg is required for this command but wasn't found.\n\n"
+            "See \"Installing ffmpeg and ADB\" in the README for install commands per OS,\n"
+            "then confirm `ffmpeg -version` works from a terminal and try again."
+        )
+
+
 def _ffmpeg_remux(src: pathlib.Path, dst: pathlib.Path):
     if FFmpeg is None:
         print("  ⚠️  python-ffmpeg not installed — skipping remux")
@@ -1255,6 +1267,7 @@ def main():
         return
 
     if args.command == "download":
+        _require_ffmpeg()
         if args.dest:
             global OUTPUT_BASE
             OUTPUT_BASE = Path(args.dest)
@@ -1264,6 +1277,7 @@ def main():
         return
 
     if args.command == "backup":
+        _require_ffmpeg()
         destination = args.to or prompt_destination()
         cache_default = {"phone": BACKUP_PHONE_CACHE_PATH,
                          "itunes": BACKUP_ITUNES_CACHE_PATH,
