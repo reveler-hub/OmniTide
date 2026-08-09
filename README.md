@@ -102,15 +102,28 @@ On **Linux/macOS**, run the scripts as `./OmniTide.py ...` (not `python3 OmniTid
 
 ---
 
+## How to invoke commands
+
+Every example below is written as a bare command, e.g. `sync phone --read-tags`. Prefix it according to how you installed OmniTide:
+
+| Install | Prefix |
+| :--- | :--- |
+| Linux binary | `./OmniTide-linux` |
+| macOS binary | `./OmniTide-macos` |
+| Windows binary | `.\OmniTide.exe` |
+| Linux/macOS venv | `./OmniTide.py` |
+| Windows venv | `python OmniTide.py` |
+
+So `sync phone --read-tags` means, for example, `./OmniTide.py sync phone --read-tags` on a Linux/macOS venv, or `.\OmniTide.exe sync phone --read-tags` with the Windows binary.
+
+---
+
 ## First run — Tidal login
 
 Run `login` first to authenticate:
 
-```bash
-./OmniTide-linux login    # Linux binary
-.\OmniTide.exe login      # Windows binary
-./OmniTide.py login       # Linux/macOS venv
-python OmniTide.py login  # Windows venv
+```
+login
 ```
 
 The script prints a URL. Open it in your browser, log in to Tidal, and the script continues automatically. Your session is saved to `token.json` – you won't need to log in again unless you delete it.
@@ -127,18 +140,14 @@ OmniTide supports two sources: **Android phone** and **iTunes/Apple Music**.
 2. Connect your phone via USB and accept the ADB authorisation prompt.
 3. Run:
 
-```bash
-./OmniTide-linux sync phone        # Linux binary
-.\OmniTide.exe sync phone          # Windows binary
-./OmniTide.py sync phone           # Linux/macOS venv
-python OmniTide.py sync phone      # Windows venv
+```
+sync phone
 ```
 
 The script scans `/sdcard/Music/`. Each subfolder becomes a Tidal playlist. By default, artist/title are guessed from filenames — add `--read-tags` to read them from each file's embedded `ARTIST`/`TITLE`/`TIDALID` tags instead (FLAC, OGG, MP3, M4A/AAC), which is more accurate but slower since it pulls a chunk of every file over ADB:
 
-```bash
-./OmniTide.py sync phone --read-tags        # Linux/macOS venv
-python OmniTide.py sync phone --read-tags   # Windows venv
+```
+sync phone --read-tags
 ```
 
 **Every run after the first is incremental.** OmniTide remembers what it already synced in a small cache file (`.omnitide_phone_cache.json` next to the script, or point elsewhere with `--cache-file FILE` if you're managing more than one phone/library). On each run it only:
@@ -150,11 +159,8 @@ Use `--only NAME` to restrict a run to playlists whose name contains `NAME`.
 
 ### iTunes / Apple Music (macOS and Windows)
 
-```bash
-./OmniTide-macos sync itunes        # macOS binary
-.\OmniTide.exe sync itunes          # Windows binary
-./OmniTide.py sync itunes           # macOS venv
-python OmniTide.py sync itunes      # Windows venv
+```
+sync itunes
 ```
 
 The script auto‑detects your library file at:
@@ -163,10 +169,11 @@ The script auto‑detects your library file at:
 
 If your library is elsewhere, specify it:
 
-```bash
-./OmniTide.py sync itunes --path "path/to/library.xml"                  # macOS venv
-python OmniTide.py sync itunes --path "C:\path\to\library.xml"          # Windows venv
 ```
+sync itunes --path "path/to/library.xml"
+```
+
+(On Windows, use a Windows-style path: `sync itunes --path "C:\path\to\library.xml"`.)
 
 **Like phone sync, this is incremental** — OmniTide remembers what it already synced in `.omnitide_itunes_cache.json` (or point elsewhere with `--cache-file FILE`). Re-running only adds tracks new to a playlist since last time, and prompts before removing anything from Tidal if a track was removed from the iTunes side (same behavior as phone sync — see above).
 
@@ -185,13 +192,11 @@ Near the top of `OmniTide.py` (or in the binary, you can’t edit it; use the Py
 
 Download tracks, albums, or playlists by URL:
 
-```bash
-./OmniTide.py download "https://tidal.com/browse/track/12345678"
-./OmniTide.py download "https://tidal.com/browse/album/12345678"
-./OmniTide.py download "https://tidal.com/browse/playlist/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
-
-On Windows (venv), use `python OmniTide.py download "URL"` instead of `./OmniTide.py download "URL"`; with the binary, `.\OmniTide.exe download "URL"`.
+download "https://tidal.com/browse/track/12345678"
+download "https://tidal.com/browse/album/12345678"
+download "https://tidal.com/browse/playlist/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
 
 Files are saved to your home folder under `Tidal Download/` by default (`~/Tidal Download/` on Linux/macOS, `C:\Users\<you>\Tidal Download\` on Windows) — use `--dest DIR` to change it. Downloads include full metadata, album art, and the **Tidal ID** embedded in a custom `TIDALID` tag.
 
@@ -201,8 +206,8 @@ Files are saved to your home folder under `Tidal Download/` by default (`~/Tidal
 
 While `download` fetches one track/album/playlist by URL, `backup` downloads **everything** — every playlist you own, plus every track in your Liked Songs, in one go:
 
-```bash
-./OmniTide.py backup
+```
+backup
 ```
 
 It asks where to save it:
@@ -237,7 +242,7 @@ Like phone/iTunes sync, backup is incremental — it remembers what's already be
 | `download URL [--dest DIR]` | Download a track, album, or playlist |
 | `backup [--to {phone,itunes,folder}] [--dest DIR] [--cache-file FILE]` | Download every owned playlist + Liked Songs from your account |
 
-Run `./OmniTide.py <command> --help` for a command's full option list, or `./OmniTide.py --help` for the top-level list (on Windows: `python OmniTide.py <command> --help`, or `.\OmniTide.exe <command> --help` with the binary).
+Run `<command> --help` for a command's full option list, or `--help` for the top-level list (see "How to invoke commands" above for your prefix).
 
 ---
 
