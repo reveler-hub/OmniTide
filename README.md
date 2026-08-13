@@ -3,7 +3,7 @@
 Sync your Android phone or iTunes/Apple Music library to Tidal as real playlists, download tracks/albums/playlists as full-metadata FLAC files, and back up your entire Tidal account — all from one single-file Python tool, no third-party sync service required.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-GPL--3.0-green)
+![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 A single-file Python tool that does three things:
