@@ -46,7 +46,7 @@ try:
     import requests
     import tidalapi
     from tidalapi import Quality
-    from tidalapi.media import Track, Video
+    from tidalapi.media import Codec, Track, Video
 except ImportError as e:
     sys.exit(
         f"❌ Missing dependency: {e.name}\n\n"
@@ -138,7 +138,7 @@ def _save_token(session: tidalapi.Session, token_path: Path):
 def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
     if not token_path.exists():
         print("🔐 No token found — starting Tidal login...")
-        session = tidalapi.Session(tidalapi.Config(quality=Quality.high_lossless))
+        session = tidalapi.Session(tidalapi.Config(quality=Quality.hi_res_lossless))
         session.login_oauth_simple()
         if not session.check_login():
             sys.exit("❌ Login failed.")
@@ -149,7 +149,7 @@ def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
     with open(token_path) as f:
         data = json.load(f)
 
-    session = tidalapi.Session(tidalapi.Config(quality=Quality.high_lossless))
+    session = tidalapi.Session(tidalapi.Config(quality=Quality.hi_res_lossless))
 
     retries = 3
     logged_in = False
@@ -222,13 +222,17 @@ def _extract_tags(audio) -> tuple[str, str, str]:
             if hasattr(val, "text"):  # ID3 text frame
                 val = val.text
             if isinstance(val, list):
-                return str(val[0]) if val else ""
+                if not val:
+                    return ""
+                item = val[0]
+                # MP4 freeform atoms (e.g. TIDALID on .m4a) come back as raw bytes
+                return bytes(item).decode("utf-8", "ignore") if isinstance(item, bytes) else str(item)
             return str(val)
         return ""
 
     artist   = first("ARTIST", "TPE1", "\xa9ART")
     title    = first("TITLE", "TIT2", "\xa9nam")
-    tidal_id = first("TIDALID", "TXXX:TIDALID")
+    tidal_id = first("TIDALID", "TXXX:TIDALID", "----:com.apple.iTunes:TIDALID")
     return artist, title, tidal_id
 
 
@@ -862,22 +866,37 @@ def _require_ffmpeg():
         )
 
 
-def _ffmpeg_remux(src: pathlib.Path, dst: pathlib.Path):
+def _ffmpeg_remux(src: pathlib.Path, dst_no_ext: pathlib.Path, codec: str) -> pathlib.Path:
+    """Demuxes the downloaded stream into its final container.
+
+    Tidal always delivers segments inside a fragmented-MP4/DASH wrapper,
+    regardless of the actual audio codec, so a remux step is required either
+    way. If the source codec is genuinely FLAC it's demuxed into a real
+    .flac (verified lossless — decode/re-encode preserves sample rate and
+    bit depth exactly). Anything else (lossy AAC/MP4A, no lossless master
+    available for that track) is stream-copied into .m4a instead of being
+    disguised as a FLAC — re-encoding lossy audio to FLAC can't add back
+    what was already lost, it just wastes disk space and hides the fact
+    that it happened.
+    """
+    is_lossless = codec == Codec.FLAC
+    dst = dst_no_ext.with_suffix(".flac" if is_lossless else ".m4a")
     if FFmpeg is None:
         print("  ⚠️  python-ffmpeg not installed — skipping remux")
         shutil.copy2(src, dst)
-        return
-    codec = "copy" if src.suffix.lower() == ".flac" else "flac"
+        return dst
+    acodec = "flac" if is_lossless else "copy"
     try:
         (FFmpeg(executable=FFMPEG_BIN)
          .option("y").option("hide_banner").option("nostdin")
          .input(url=str(src))
-         .output(url=str(dst), acodec=codec, map=0, map_metadata="0:g",
+         .output(url=str(dst), acodec=acodec, map=0, map_metadata="0:g",
                  movflags="use_metadata_tags", loglevel="quiet")
          .execute())
     except Exception as e:
         print(f"  ⚠️  ffmpeg error: {e} — falling back to copy")
         shutil.copy2(src, dst)
+    return dst
 
 
 def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None):
@@ -913,40 +932,86 @@ def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None):
         print(f"  ⚠️  Metadata error: {e}")
 
 
-def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path) -> bool:
-    dest_final = pathlib.Path(str(dest_no_ext) + ".flac")
-    if dest_final.exists():
-        print(f"  ↪️  Exists: {dest_final.name}")
-        return True
+def _embed_metadata_mp4(path_file: pathlib.Path, track: Track, cover: bytes | None):
+    """Same tag set as _embed_metadata, for .m4a (lossy-fallback) downloads."""
+    try:
+        m = mutagen.mp4.MP4(str(path_file))
+        album = track.album
+        if not m.tags: m.add_tags()
+        artists    = ", ".join(a.name for a in track.artists)
+        alb_artist = ", ".join(
+            a.name for a in album.artists
+            if any("MAIN" in str(r).upper() for r in getattr(a, "roles", []))
+        ) if album and hasattr(album, "artists") else artists
+        if not alb_artist: alb_artist = artists
+        m.tags["\xa9nam"] = track.full_name if hasattr(track, "full_name") else track.name
+        m.tags["\xa9ART"] = artists
+        m.tags["aART"]    = alb_artist
+        m.tags["\xa9alb"] = album.name if album else ""
+        m.tags["trkn"] = [(getattr(track, "track_num", 0) or 0,
+                            getattr(album, "num_tracks", 0) or 0 if album else 0)]
+        m.tags["disk"] = [(getattr(track, "volume_num", 1) or 1,
+                            getattr(album, "num_volumes", 1) or 1 if album else 1)]
+        if album and getattr(album, "release_date", None):
+            m.tags["\xa9day"] = str(album.release_date.year)
+        isrc      = getattr(track, "isrc",      "") or ""
+        copyright = getattr(track, "copyright", "") or ""
+        m.tags["----:com.apple.iTunes:ISRC"]      = mutagen.mp4.MP4FreeForm(isrc.encode())
+        m.tags["----:com.apple.iTunes:COPYRIGHT"] = mutagen.mp4.MP4FreeForm(copyright.encode())
+        m.tags["----:com.apple.iTunes:TIDALID"]   = mutagen.mp4.MP4FreeForm(str(track.id).encode())
+        if cover:
+            m.tags["covr"] = [mutagen.mp4.MP4Cover(cover, imageformat=mutagen.mp4.MP4Cover.FORMAT_JPEG)]
+        m.save()
+    except Exception as e:
+        print(f"  ⚠️  Metadata error: {e}")
+
+
+def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path) -> pathlib.Path | None:
+    """Downloads one track, returning the final file's path (.flac if a
+    lossless master was available, .m4a otherwise) or None on failure."""
+    for ext in (".flac", ".m4a"):
+        existing = pathlib.Path(str(dest_no_ext) + ext)
+        if existing.exists():
+            print(f"  ↪️  Exists: {existing.name}")
+            return existing
     if not getattr(track, "allow_streaming", False):
         print(f"  ⚠️  Not streamable: {track.name}")
-        return False
+        return None
     try:
         full_track = session.track(str(track.id), with_album=True)
-        manifest   = full_track.get_stream().get_stream_manifest()
+        stream     = full_track.get_stream()
+        manifest   = stream.get_stream_manifest()
     except Exception as e:
         print(f"  ❌ Stream error: {e}")
-        return False
+        return None
     if manifest.is_encrypted:
         print(f"  ⚠️  Encrypted stream — skipping")
-        return False
-    dest_final.parent.mkdir(parents=True, exist_ok=True)
+        return None
+    dest_no_ext.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=manifest.file_extension, delete=False) as tmp:
         tmp_path = pathlib.Path(tmp.name)
     print(f"  ⬇️  {full_track.name} ({len(manifest.get_urls())} segment(s))")
     if not _download_segments(manifest.get_urls(), tmp_path):
         tmp_path.unlink(missing_ok=True)
-        return False
+        return None
     print(f"  🔧 Remuxing...")
-    _ffmpeg_remux(tmp_path, dest_final)
+    dest_final = _ffmpeg_remux(tmp_path, dest_no_ext, manifest.codecs)
     tmp_path.unlink(missing_ok=True)
     if not dest_final.exists():
         print(f"  ❌ Output file not created")
-        return False
-    _embed_metadata(dest_final, full_track, cover_bytes(full_track.album) if full_track.album else None)
+        return None
+    is_lossless = dest_final.suffix == ".flac"
+    if not is_lossless:
+        print(f"  ⚠️  No MAX (lossless) quality version on Tidal for this track — delivered "
+              f"at {stream.audio_quality} (lossy), saving as .m4a")
+    cover = cover_bytes(full_track.album) if full_track.album else None
+    if is_lossless:
+        _embed_metadata(dest_final, full_track, cover)
+    else:
+        _embed_metadata_mp4(dest_final, full_track, cover)
     print(f"  ✅ {dest_final.name}")
     time.sleep(random.uniform(2, 8))
-    return True
+    return dest_final
 
 
 def parse_tidal_url(url: str) -> tuple[str, str]:
@@ -1059,11 +1124,11 @@ def _deliver_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib
     never stages more than one track's worth of local disk at a time.
     """
     if destination != "phone":
-        return download_track(session, track, dest_no_ext)
-    if not download_track(session, track, dest_no_ext):
+        return download_track(session, track, dest_no_ext) is not None
+    local_final = download_track(session, track, dest_no_ext)
+    if local_final is None:
         return False
-    local_final = pathlib.Path(str(dest_no_ext) + ".flac")
-    delivered = push_to_phone(local_final, remote_no_ext + ".flac")
+    delivered = push_to_phone(local_final, remote_no_ext + local_final.suffix)
     local_final.unlink(missing_ok=True)
     return delivered
 
