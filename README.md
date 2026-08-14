@@ -70,22 +70,6 @@ Verify either install with `ffmpeg -version` / `adb version`.
 
 ## Installation
 
-**The easiest way** is to use the **pre‑built binaries** (no Python or dependencies needed).
-
-### Option 1 — Pre‑built Binary (Recommended)
-
-1. Go to the **[Releases](https://github.com/reveler-hub/OmniTide/releases)** page.
-2. Download the latest version for your operating system:
-   - `OmniTide-linux` (Linux)
-   - `OmniTide.exe` (Windows)
-   - `OmniTide-macos` (macOS)
-3. **Linux & macOS only**: Make it executable:
-   ```bash
-   chmod +x OmniTide-linux    # or OmniTide-macos
-   ```
-
-### Option 2 — Python venv (for developers)
-
 ```bash
 git clone https://github.com/reveler-hub/OmniTide
 cd OmniTide
@@ -108,17 +92,14 @@ On **Linux/macOS**, run the scripts as `./OmniTide.py ...` (not `python3 OmniTid
 
 ## How to invoke commands
 
-Every example below is written as a bare command, e.g. `sync phone --read-tags`. Prefix it according to how you installed OmniTide:
+Every example below is written as a bare command, e.g. `sync phone --read-tags`. Prefix it according to your OS:
 
-| Install | Prefix |
+| OS | Prefix |
 | :--- | :--- |
-| Linux binary | `./OmniTide-linux` |
-| macOS binary | `./OmniTide-macos` |
-| Windows binary | `.\OmniTide.exe` |
-| Linux/macOS venv | `./OmniTide.py` |
-| Windows venv | `python OmniTide.py` |
+| Linux/macOS | `./OmniTide.py` |
+| Windows | `python OmniTide.py` |
 
-So `sync phone --read-tags` means, for example, `./OmniTide.py sync phone --read-tags` on a Linux/macOS venv, or `.\OmniTide.exe sync phone --read-tags` with the Windows binary.
+So `sync phone --read-tags` means, for example, `./OmniTide.py sync phone --read-tags` on Linux/macOS, or `python OmniTide.py sync phone --read-tags` on Windows.
 
 ---
 
@@ -185,7 +166,7 @@ sync itunes --path "path/to/library.xml"
 
 ## Customising sync and downloads
 
-Near the top of `OmniTide.py` (or in the binary, you can’t edit it; use the Python version if you need this), you can set:
+Near the top of `OmniTide.py`, you can set:
 
 - **`SKIP_AS_ARTIST`** – Folder names that should **not** be used as artist when guessing from the filename. Useful for mix folders like `Workout Tracks`.
 - **`SKIP_PLAYLISTS`** – Folder names to **completely ignore** during sync (e.g., audiobooks, voice memos).
