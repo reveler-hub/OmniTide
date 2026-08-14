@@ -6,6 +6,7 @@ if [ -x "$VENV_PY" ]; then
 fi
 exec python3 "$0" "$@"
 ":"""
+from __future__ import annotations
 """
 OmniTide: Phone Sync & Downloader
 
