@@ -35,7 +35,7 @@ import threading
 import time
 import urllib.request
 import concurrent.futures
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 
@@ -48,6 +48,7 @@ try:
     import requests
     import tidalapi
     from tidalapi import Quality
+    from tidalapi.exceptions import TooManyRequests
     from tidalapi.media import Codec, Track, Video
 except ImportError as e:
     sys.exit(
@@ -848,15 +849,33 @@ def cover_bytes(album) -> bytes | None:
         return None
 
 
-def _download_segments(urls: list[str], dest: pathlib.Path) -> bool:
+def _download_segments(urls: list[str], dest: pathlib.Path, retries: int = 3) -> bool:
+    """Downloads segments in order, retrying an individual segment (not the
+    whole track) on transient CDN errors like connection resets/timeouts.
+
+    On a failed attempt, seeks back and truncates to that segment's start
+    position before retrying — otherwise a partial write from the failed
+    attempt would be left in place and the retry's bytes would be appended
+    after it, corrupting the file instead of cleanly replacing it.
+    """
     try:
         with open(dest, "wb") as out:
             for url in urls:
-                with urllib.request.urlopen(url, timeout=60) as r:
-                    while True:
-                        chunk = r.read(CHUNK_SIZE)
-                        if not chunk: break
-                        out.write(chunk)
+                start_pos = out.tell()
+                for attempt in range(retries):
+                    try:
+                        with urllib.request.urlopen(url, timeout=60) as r:
+                            while True:
+                                chunk = r.read(CHUNK_SIZE)
+                                if not chunk: break
+                                out.write(chunk)
+                        break
+                    except Exception:
+                        if attempt == retries - 1:
+                            raise
+                        out.seek(start_pos)
+                        out.truncate()
+                        time.sleep(random.uniform(1, 3) * (attempt + 1))
         return True
     except Exception as e:
         print(f"  ❌ Download error: {e}")
@@ -877,13 +896,13 @@ def _ffmpeg_remux(src: pathlib.Path, dst_no_ext: pathlib.Path, codec: str) -> pa
 
     Tidal always delivers segments inside a fragmented-MP4/DASH wrapper,
     regardless of the actual audio codec, so a remux step is required either
-    way. If the source codec is genuinely FLAC it's demuxed into a real
-    .flac (verified lossless — decode/re-encode preserves sample rate and
-    bit depth exactly). Anything else (lossy AAC/MP4A, no lossless master
-    available for that track) is stream-copied into .m4a instead of being
-    disguised as a FLAC — re-encoding lossy audio to FLAC can't add back
-    what was already lost, it just wastes disk space and hides the fact
-    that it happened.
+    way. If the source codec is genuinely FLAC it's stream-copied into a
+    real .flac (bit-identical — FLAC-in-fMP4 can be remuxed straight into a
+    native FLAC container without decoding). Anything else (lossy AAC/MP4A,
+    no lossless master available for that track) is stream-copied into .m4a
+    instead of being disguised as a FLAC — re-encoding lossy audio to FLAC
+    can't add back what was already lost, it just wastes disk space and
+    hides the fact that it happened.
     """
     is_lossless = codec == Codec.FLAC
     # Path.with_suffix() would treat a literal "." in the filename itself
@@ -894,7 +913,7 @@ def _ffmpeg_remux(src: pathlib.Path, dst_no_ext: pathlib.Path, codec: str) -> pa
         print("  ⚠️  python-ffmpeg not installed — skipping remux")
         shutil.copy2(src, dst)
         return dst
-    acodec = "flac" if is_lossless else "copy"
+    acodec = "copy"
     try:
         (FFmpeg(executable=FFMPEG_BIN)
          .option("y").option("hide_banner").option("nostdin")
@@ -908,7 +927,7 @@ def _ffmpeg_remux(src: pathlib.Path, dst_no_ext: pathlib.Path, codec: str) -> pa
     return dst
 
 
-def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None):
+def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None, playlist: str | None = None):
     try:
         m = mutagen.flac.FLAC(str(path_file))
         album = track.album
@@ -931,6 +950,8 @@ def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None):
         m.tags["ISRC"]        = getattr(track, "isrc",      "") or ""
         m.tags["COPYRIGHT"]   = getattr(track, "copyright", "") or ""
         m.tags["TIDALID"] = str(track.id)
+        if playlist:
+            m.tags["PLAYLIST"] = playlist
         if cover:
             pic = Picture()
             pic.type, pic.mime, pic.data = 3, "image/jpeg", cover
@@ -941,7 +962,7 @@ def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None):
         print(f"  ⚠️  Metadata error: {e}")
 
 
-def _embed_metadata_mp4(path_file: pathlib.Path, track: Track, cover: bytes | None):
+def _embed_metadata_mp4(path_file: pathlib.Path, track: Track, cover: bytes | None, playlist: str | None = None):
     """Same tag set as _embed_metadata, for .m4a (lossy-fallback) downloads."""
     try:
         m = mutagen.mp4.MP4(str(path_file))
@@ -968,6 +989,8 @@ def _embed_metadata_mp4(path_file: pathlib.Path, track: Track, cover: bytes | No
         m.tags["----:com.apple.iTunes:ISRC"]      = mutagen.mp4.MP4FreeForm(isrc.encode())
         m.tags["----:com.apple.iTunes:COPYRIGHT"] = mutagen.mp4.MP4FreeForm(copyright.encode())
         m.tags["----:com.apple.iTunes:TIDALID"]   = mutagen.mp4.MP4FreeForm(str(track.id).encode())
+        if playlist:
+            m.tags["----:com.apple.iTunes:PLAYLIST"] = mutagen.mp4.MP4FreeForm(playlist.encode())
         if cover:
             m.tags["covr"] = [mutagen.mp4.MP4Cover(cover, imageformat=mutagen.mp4.MP4Cover.FORMAT_JPEG)]
         m.save()
@@ -975,9 +998,81 @@ def _embed_metadata_mp4(path_file: pathlib.Path, track: Track, cover: bytes | No
         print(f"  ⚠️  Metadata error: {e}")
 
 
-def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path) -> pathlib.Path | None:
-    """Downloads one track, returning the final file's path (.flac if a
-    lossless master was available, .m4a otherwise) or None on failure."""
+class _RateLimitTracker:
+    """Tracks recent stream-acquisition outcomes so pacing can adapt to how
+    the account is actually doing instead of firing at a fixed rate until
+    something breaks, and so a sustained bad patch trips an automatic
+    cooldown instead of relying on a human watching the log.
+
+    Persist one instance across an entire backup/download run (not per
+    playlist) — the throttling that prompted this was observed building up
+    across many playlists over the course of a long run, not within one.
+    """
+    def __init__(self, window: int = 20):
+        self.outcomes: deque[bool] = deque(maxlen=window)  # True = was rate-limited
+        self._cooldown_stage = 0
+
+    def record(self, was_rate_limited: bool) -> None:
+        self.outcomes.append(was_rate_limited)
+
+    def hit_rate(self) -> float:
+        return (sum(self.outcomes) / len(self.outcomes)) if self.outcomes else 0.0
+
+    def pacing_range(self) -> tuple[float, float]:
+        """Base (low, high) seconds to pace successful acquisitions by,
+        stretched when the recent hit rate climbs."""
+        rate = self.hit_rate()
+        if rate >= 0.30:
+            return (12, 40)
+        if rate >= 0.15:
+            return (6, 20)
+        return (2, 8)
+
+    def should_trip_breaker(self, recent: int = 10, threshold: int = 3) -> bool:
+        """True if >=threshold of the last `recent` acquisitions were
+        rate-limited — a sustained bad patch, not an isolated blip."""
+        if len(self.outcomes) < recent:
+            return False
+        return sum(list(self.outcomes)[-recent:]) >= threshold
+
+    def next_cooldown(self) -> int:
+        """Escalating cooldown in seconds: 2m, 5m, 10m, capped at 15m."""
+        stages = (120, 300, 600, 900)
+        cooldown = stages[min(self._cooldown_stage, len(stages) - 1)]
+        self._cooldown_stage += 1
+        return cooldown
+
+    def reset_after_cooldown(self) -> None:
+        self.outcomes.clear()
+
+
+def _check_circuit_breaker(tracker: "_RateLimitTracker") -> None:
+    """Pauses with an escalating cooldown if the recent rate-limit hit rate
+    shows a sustained bad patch, instead of grinding through it untouched."""
+    if tracker.should_trip_breaker():
+        cooldown = tracker.next_cooldown()
+        print(f"  🛑 Rate-limit hit rate too high — pausing {cooldown}s before continuing...")
+        time.sleep(cooldown)
+        tracker.reset_after_cooldown()
+
+
+def _acquire_stream(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path,
+                    tracker: "_RateLimitTracker | None" = None):
+    """Resolves a track to a downloadable stream manifest.
+
+    This calls Tidal's `playbackinfopostpaywall` endpoint (via get_stream()),
+    which acquires a playback license and has its own — much stricter — rate
+    limit than the CDN segment-download endpoint. tidalapi masks a 429 here as
+    a generic "Stream unavailable" TooManyRequests, indistinguishable in the
+    logs from a genuinely unlicensed track, so this retries with its
+    server-supplied retry_after before giving up. Must be called sequentially
+    (one at a time, not from a thread pool) — firing many of these
+    concurrently is what triggers the rate limit in the first place.
+
+    Returns the existing file's path if one is already downloaded, a
+    (full_track, stream, manifest) tuple if a fresh download is needed, or
+    None if the track can't be acquired.
+    """
     for ext in (".flac", ".m4a"):
         existing = pathlib.Path(str(dest_no_ext) + ext)
         if existing.exists():
@@ -986,16 +1081,45 @@ def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib
     if not getattr(track, "allow_streaming", False):
         print(f"  ⚠️  Not streamable: {track.name}")
         return None
-    try:
-        full_track = session.track(str(track.id), with_album=True)
-        stream     = full_track.get_stream()
-        manifest   = stream.get_stream_manifest()
-    except Exception as e:
-        print(f"  ❌ Stream error: {e}")
+    was_rate_limited = False
+    for attempt in range(3):
+        try:
+            full_track = session.track(str(track.id), with_album=True)
+            stream     = full_track.get_stream()
+            manifest   = stream.get_stream_manifest()
+            break
+        except TooManyRequests as e:
+            was_rate_limited = True
+            wait = e.retry_after if e.retry_after > 0 else 15
+            print(f"  ⏳ Rate limited, waiting {wait}s (attempt {attempt + 1}/3)...")
+            time.sleep(wait)
+        except Exception as e:
+            print(f"  ❌ Stream error: {e}")
+            if tracker is not None:
+                tracker.record(False)
+            return None
+    else:
+        if tracker is not None:
+            tracker.record(True)
+        print(f"  ❌ Still rate limited after 3 attempts — skipping")
         return None
+    if tracker is not None:
+        tracker.record(was_rate_limited)
     if manifest.is_encrypted:
         print(f"  ⚠️  Encrypted stream — skipping")
         return None
+    lo, hi = tracker.pacing_range() if tracker is not None else (2, 8)
+    time.sleep(random.uniform(lo, hi))
+    return full_track, stream, manifest
+
+
+def _download_and_process(full_track: Track, stream, manifest, dest_no_ext: pathlib.Path,
+                          playlist: str | None = None) -> pathlib.Path | None:
+    """Downloads segments from the CDN, remuxes, and tags one track.
+
+    Unlike _acquire_stream, this only talks to the CDN (not Tidal's
+    playback-license endpoint), so it's safe to run concurrently.
+    """
     dest_no_ext.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=manifest.file_extension, delete=False) as tmp:
         tmp_path = pathlib.Path(tmp.name)
@@ -1015,12 +1139,43 @@ def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib
               f"at {stream.audio_quality} (lossy), saving as .m4a")
     cover = cover_bytes(full_track.album) if full_track.album else None
     if is_lossless:
-        _embed_metadata(dest_final, full_track, cover)
+        _embed_metadata(dest_final, full_track, cover, playlist)
     else:
-        _embed_metadata_mp4(dest_final, full_track, cover)
+        _embed_metadata_mp4(dest_final, full_track, cover, playlist)
     print(f"  ✅ {dest_final.name}")
-    time.sleep(random.uniform(2, 8))
     return dest_final
+
+
+def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path) -> pathlib.Path | None:
+    """Downloads one track end-to-end (acquire + download + remux + tag)."""
+    acquired = _acquire_stream(session, track, dest_no_ext)
+    if acquired is None or isinstance(acquired, pathlib.Path):
+        return acquired
+    full_track, stream, manifest = acquired
+    return _download_and_process(full_track, stream, manifest, dest_no_ext)
+
+
+def _download_many(session: tidalapi.Session, dests: list[tuple[Track, pathlib.Path]],
+                   playlist: str | None = None) -> None:
+    """Downloads many tracks: acquires stream manifests one at a time (Tidal
+    rate-limits that endpoint hard, so pacing adapts and auto-pauses if hits
+    start clustering), then downloads/remuxes/tags concurrently — up to
+    MAX_CONCURRENT_DOWNLOADS — since that stage only talks to the CDN."""
+    tracker = _RateLimitTracker()
+    jobs = []
+    for track, dest in dests:
+        _check_circuit_breaker(tracker)
+        acquired = _acquire_stream(session, track, dest, tracker)
+        if acquired is None or isinstance(acquired, pathlib.Path):
+            continue
+        full_track, stream, manifest = acquired
+        jobs.append((full_track, stream, manifest, dest))
+    if not jobs:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
+        futs = [ex.submit(_download_and_process, ft, st, mf, dest, playlist) for ft, st, mf, dest in jobs]
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
 
 
 def parse_tidal_url(url: str) -> tuple[str, str]:
@@ -1059,11 +1214,7 @@ def process_download(session: tidalapi.Session, url: str):
             exp    = explicit_tag(getattr(track, "explicit", False))
             dest   = OUTPUT_BASE / "Albums" / f"{alb_artist} - {alb_title}{alb_exp}" / f"{num}. {artist} - {title}{exp}"
             dests.append((track, dest))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
-            futs = {ex.submit(download_track, session, track, dest): track for track, dest in dests}
-            for fut in concurrent.futures.as_completed(futs):
-                print(f"  ✔ {futs[fut].name}")
-                fut.result()
+        _download_many(session, dests)
     elif media_type in ("playlist", "mix"):
         playlist = session.playlist(media_id)
         items    = playlist.tracks()
@@ -1079,11 +1230,7 @@ def process_download(session: tidalapi.Session, url: str):
             title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
             dest   = OUTPUT_BASE / "Playlists" / pl_name / f"{str(i).zfill(width)}. {artist} - {title}"
             dests.append((track, dest))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
-            futs = {ex.submit(download_track, session, track, dest): track for track, dest in dests}
-            for fut in concurrent.futures.as_completed(futs):
-                print(f"  ✔ {futs[fut].name}")
-                fut.result()
+        _download_many(session, dests, playlist=playlist.name)
     else:
         sys.exit(f"❌ Unsupported type: {media_type}")
 
@@ -1134,21 +1281,22 @@ def push_to_phone(local_path: pathlib.Path, remote_path: str) -> bool:
         sys.exit("❌ ADB not found. Install android-tools and connect your phone.")
 
 
-def _deliver_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path,
-                   destination: str, remote_no_ext: str | None = None,
-                   push_lock: threading.Lock | None = None) -> bool:
-    """Downloads one track and delivers it to the chosen destination.
+def _deliver_acquired(full_track: Track, stream, manifest, dest_no_ext: pathlib.Path,
+                      destination: str, remote_no_ext: str | None = None,
+                      push_lock: threading.Lock | None = None,
+                      playlist: str | None = None) -> bool:
+    """Downloads/remuxes/tags an already-acquired track and delivers it to the
+    chosen destination. Safe to run concurrently (see _download_and_process).
 
-    'itunes'/'folder': a plain download_track() call — safe to run concurrently,
-    each track gets its own file. 'phone': downloads to a local temp path (also
-    concurrency-safe, one temp file per track), then adb-pushes it. The adb push
-    itself is serialized via push_lock when provided — concurrent adb pushes over
-    a single USB connection are untested, so downloading/remuxing overlaps across
-    tracks but pushes to the phone happen one at a time.
+    'itunes'/'folder': each track gets its own file. 'phone': downloads to a
+    local temp path, then adb-pushes it. The adb push itself is serialized via
+    push_lock when provided — concurrent adb pushes over a single USB
+    connection are untested, so downloading/remuxing overlaps across tracks
+    but pushes to the phone happen one at a time.
     """
     if destination != "phone":
-        return download_track(session, track, dest_no_ext) is not None
-    local_final = download_track(session, track, dest_no_ext)
+        return _download_and_process(full_track, stream, manifest, dest_no_ext, playlist) is not None
+    local_final = _download_and_process(full_track, stream, manifest, dest_no_ext, playlist)
     if local_final is None:
         return False
     remote_path = remote_no_ext + local_final.suffix
@@ -1179,6 +1327,10 @@ def backup_tidal(session: tidalapi.Session, destination: str,
     cache = load_cache(cache_path)
     cache_lock = threading.Lock()
     push_lock  = threading.Lock() if destination == "phone" else None
+    # One tracker for the whole run (not per-playlist) — the throttling this
+    # guards against was observed building up across many playlists over a
+    # long run, not within a single one.
+    tracker = _RateLimitTracker()
 
     if destination == "phone":
         base = PHONE_BACKUP_BASE
@@ -1190,27 +1342,51 @@ def backup_tidal(session: tidalapi.Session, destination: str,
     tmp_dir_ctx = tempfile.TemporaryDirectory(prefix="omnitide_backup_") if destination == "phone" else None
     tmp_dir = Path(tmp_dir_ctx.name) if tmp_dir_ctx else None
 
-    def deliver(track: Track, local_rel: pathlib.Path, remote_rel: str) -> bool:
-        if destination == "phone":
-            local_dest  = tmp_dir / str(track.id)
-            remote_dest = f"{base}/{remote_rel}"
-            return _deliver_track(session, track, local_dest, "phone", remote_dest, push_lock)
-        return _deliver_track(session, track, Path(base) / local_rel, destination)
-
     delivered_count = skipped_count = 0
     counts_lock = threading.Lock()
 
-    def process_one(track: Track, local_rel: pathlib.Path, remote_rel: str,
-                    key: str, scope: str, artist: str, title: str) -> None:
+    def mark_delivered(key: str, scope: str, track: Track, artist: str, title: str) -> None:
         nonlocal delivered_count
-        if deliver(track, local_rel, remote_rel):
-            with cache_lock:
-                cache[key] = {"tidal_id": str(track.id), "artist": artist, "title": title, "playlist": scope}
-                save_cache(cache_path, cache)
-            with counts_lock:
-                delivered_count += 1
+        with cache_lock:
+            cache[key] = {"tidal_id": str(track.id), "artist": artist, "title": title, "playlist": scope}
+            save_cache(cache_path, cache)
+        with counts_lock:
+            delivered_count += 1
 
-    def run_batch(jobs: list[tuple]) -> None:
+    def process_one(full_track, stream, manifest, dest_no_ext: pathlib.Path, remote_rel: str,
+                    key: str, scope: str, artist: str, title: str, track: Track) -> None:
+        playlist_label = "Liked Songs" if scope == "liked" else scope.split("::", 1)[-1]
+        if destination == "phone":
+            remote_dest = f"{base}/{remote_rel}"
+            ok = _deliver_acquired(full_track, stream, manifest, dest_no_ext, "phone", remote_dest,
+                                    push_lock, playlist_label)
+        else:
+            ok = _deliver_acquired(full_track, stream, manifest, dest_no_ext, destination,
+                                    playlist=playlist_label)
+        if ok:
+            mark_delivered(key, scope, track, artist, title)
+
+    def run_batch(entries: list[tuple]) -> None:
+        """entries: (track, local_rel, remote_rel, key, scope, artist, title).
+
+        Acquires stream manifests one at a time first — Tidal rate-limits that
+        endpoint hard — then downloads/remuxes/tags the acquired tracks
+        concurrently, since that stage only talks to the CDN.
+        """
+        if not entries:
+            return
+        jobs = []
+        for track, local_rel, remote_rel, key, scope, artist, title in entries:
+            _check_circuit_breaker(tracker)
+            dest_no_ext = (tmp_dir / str(track.id)) if destination == "phone" else Path(base) / local_rel
+            acquired = _acquire_stream(session, track, dest_no_ext, tracker)
+            if acquired is None:
+                continue
+            if isinstance(acquired, pathlib.Path):
+                mark_delivered(key, scope, track, artist, title)
+                continue
+            full_track, stream, manifest = acquired
+            jobs.append((full_track, stream, manifest, dest_no_ext, remote_rel, key, scope, artist, title, track))
         if not jobs:
             return
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:

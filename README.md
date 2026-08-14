@@ -17,6 +17,10 @@ No third‑party sync services. Just a Tidal account.
 ---
 ## New in this version
 
+- **More resilient downloads** – a segment that fails to download (dropped connection, timeout) now retries on its own instead of failing the whole track. If Tidal starts rate-limiting heavily, OmniTide backs off automatically (and pauses for a few minutes if it keeps happening) instead of hammering through it.
+- **Faster, truer lossless downloads** – FLAC tracks are now copied through bit-for-bit instead of being decoded and re-encoded, so lossless downloads are quicker with no quality difference.
+- **Playlist tag on downloaded tracks** – tracks downloaded via `backup` now store which playlist (or "Liked Songs") they came from in a `PLAYLIST` tag on the file itself, so that info survives even if you move the file out of its folder.
+- **Lossy fallback is clearly labeled** – not every track has a lossless master on Tidal. When one doesn't, OmniTide says so and saves it as `.m4a` instead of silently mislabeling it as a lossless `.flac`.
 - **Whole-account backup** – the new `backup` command downloads every playlist you own plus your Liked Songs to your phone, an iTunes-import folder, or the current folder. Incremental — re-running only fetches what's new since last time.
 - **Incremental phone *and* iTunes sync** – both `sync phone` and `sync itunes` now diff against a small local cache instead of re-processing your whole library every run. Songs already synced are skipped entirely; only new or removed songs touch the Tidal API. If a song disappears from your source, OmniTide asks before removing it from the matching Tidal playlist — it never removes tracks without confirming first. If that leaves the playlist empty, it deletes the (now-empty) playlist too.
 - **Tag-aware matching** – `sync phone --read-tags` reads `ARTIST`/`TITLE`/`TIDALID` from each file's embedded tags (FLAC, OGG, MP3, M4A/AAC) instead of guessing from the filename, for more accurate matching.
@@ -90,7 +94,7 @@ cd OmniTide
 ./setup_linux.sh
 ./OmniTide.py login
 
-# Windows
+# Windows (Command Prompt)
 setup_windows.bat
 OmniTide_Env\Scripts\activate
 python OmniTide.py login
@@ -179,12 +183,13 @@ sync itunes --path "path/to/library.xml"
 
 ---
 
-## Customising the sync
+## Customising sync and downloads
 
 Near the top of `OmniTide.py` (or in the binary, you can’t edit it; use the Python version if you need this), you can set:
 
 - **`SKIP_AS_ARTIST`** – Folder names that should **not** be used as artist when guessing from the filename. Useful for mix folders like `Workout Tracks`.
 - **`SKIP_PLAYLISTS`** – Folder names to **completely ignore** during sync (e.g., audiobooks, voice memos).
+- **`MAX_CONCURRENT_DOWNLOADS`** – How many tracks `download`/`backup` process (downloading/remuxing/tagging) at once, default `50`. Doesn't affect how fast OmniTide *requests permission* to stream each track — that part is always sequential, since Tidal rate-limits it strictly regardless of this setting.
 
 ---
 
@@ -198,7 +203,9 @@ download "https://tidal.com/browse/album/12345678"
 download "https://tidal.com/browse/playlist/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
-Files are saved to your home folder under `Tidal Download/` by default (`~/Tidal Download/` on Linux/macOS, `C:\Users\<you>\Tidal Download\` on Windows) — use `--dest DIR` to change it. Downloads include full metadata, album art, and the **Tidal ID** embedded in a custom `TIDALID` tag.
+Files are saved to your home folder under `Tidal Download/` by default (`~/Tidal Download/` on Linux/macOS, `C:\Users\<you>\Tidal Download\` on Windows) — use `--dest DIR` to change it, into `Tracks/`, `Albums/<Artist - Album>/`, or `Playlists/<name>/` depending on what you downloaded. Downloads include full metadata, album art, and the **Tidal ID** embedded in a custom `TIDALID` tag.
+
+Not every track has a lossless master available on Tidal. When one doesn't, OmniTide says so and saves it as a lossy `.m4a` instead of a lossless `.flac` — check the output for a "No MAX (lossless) quality version" note to see which tracks this happened for.
 
 ---
 
@@ -226,7 +233,7 @@ Pass `--to {phone,itunes,folder}` to skip the prompt (required if you're running
 - **iTunes** — saves to `~/Music/OmniTide Backup/` by default (override with `--dest DIR`). This just organizes files into folders — OmniTide doesn't have a way to make iTunes actually import them or build playlists on its own; you'd add them to your iTunes library yourself afterward.
 - **Current folder** — saves to wherever you run the command from (override with `--dest DIR`).
 
-All three use the same layout: `Playlists/<name>/01. Artist - Title.flac` for owned playlists, `Liked Songs/Artist - Title.flac` for liked tracks. **If a song is both liked and in one of your playlists, it's downloaded to both places** — liking a song is treated as its own thing, not deduplicated against playlist membership.
+All three use the same layout: `Playlists/<name>/01. Artist - Title.flac` for owned playlists, `Liked Songs/Artist - Title.flac` for liked tracks (`.m4a` instead of `.flac` for tracks with no lossless master — see "Downloading from Tidal" above). **If a song is both liked and in one of your playlists, it's downloaded to both places** — liking a song is treated as its own thing, not deduplicated against playlist membership. Each copy also stores which playlist (or "Liked Songs") it came from in a `PLAYLIST` tag on the file itself.
 
 Like phone/iTunes sync, backup is incremental — it remembers what's already been delivered (separately per destination: `.omnitide_backup_phone_cache.json`, `.omnitide_backup_itunes_cache.json`, `.omnitide_backup_folder_cache.json`, or override with `--cache-file FILE`) and only fetches what's new on later runs. Unlike sync, it doesn't mirror deletions — if you unfavorite a track or remove it from a playlist on Tidal, your already-downloaded copy is left alone.
 
@@ -265,6 +272,12 @@ Backup tracks what it's already delivered in `.omnitide_backup_{phone,itunes,fol
 
 **A song shows up twice after running `backup`**  
 Expected, not a bug — if a track is both in a playlist and in your Liked Songs, it's downloaded to both `Playlists/<name>/` and `Liked Songs/` on purpose (see "Backing up your whole Tidal account" above).
+
+**Some downloaded files are `.m4a` instead of `.flac`**  
+Expected, not a bug — that track has no lossless master available on Tidal, so OmniTide delivers it at the best available lossy quality and saves it as `.m4a` rather than mislabeling it as a lossless FLAC. Look for a "No MAX (lossless) quality version" line in the output for the affected track.
+
+**OmniTide pauses for a few minutes partway through a large `download`/`backup`**  
+Expected, not a bug — Tidal rate-limits how fast you can request permission to stream tracks. OmniTide slows itself down automatically as it gets rate-limited more, and if it keeps happening, it pauses entirely for a few minutes (printed as "Rate-limit hit rate too high — pausing...") before continuing on its own. No action needed — just let it run.
 
 **ffmpeg not found**  
 `download` and `backup` exit immediately with this error since both need ffmpeg to remux tracks. See "Installing ffmpeg and ADB" above, then confirm `ffmpeg -version` works from a terminal.

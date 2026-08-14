@@ -4,3 +4,7 @@ __pycache__/
 token.json
 unmatched_songs.txt
 .omnitide_phone_cache.json
+.omnitide_itunes_cache.json
+.omnitide_backup_phone_cache.json
+.omnitide_backup_itunes_cache.json
+.omnitide_backup_folder_cache.json
