@@ -31,8 +31,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+import concurrent.futures
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -98,6 +100,10 @@ PHONE_BACKUP_BASE  = "/sdcard/OmniTide Backup"   # sibling of /sdcard/Music, NOT
 BACKUP_PHONE_CACHE_PATH  = Path(".omnitide_backup_phone_cache.json")
 BACKUP_ITUNES_CACHE_PATH = Path(".omnitide_backup_itunes_cache.json")
 BACKUP_FOLDER_CACHE_PATH = Path(".omnitide_backup_folder_cache.json")
+
+# Empirically tested (see project history): ~50 concurrent Tidal stream downloads
+# complete cleanly; above that, connections start timing out / resetting.
+MAX_CONCURRENT_DOWNLOADS = 50
 
 SKIP_AS_ARTIST: set[str] = set()
 SKIP_PLAYLISTS: set[str] = set()
@@ -880,7 +886,10 @@ def _ffmpeg_remux(src: pathlib.Path, dst_no_ext: pathlib.Path, codec: str) -> pa
     that it happened.
     """
     is_lossless = codec == Codec.FLAC
-    dst = dst_no_ext.with_suffix(".flac" if is_lossless else ".m4a")
+    # Path.with_suffix() would treat a literal "." in the filename itself
+    # (e.g. "01. Artist - Title") as the extension to replace, truncating
+    # everything after it — plain string concatenation avoids that.
+    dst = pathlib.Path(str(dst_no_ext) + (".flac" if is_lossless else ".m4a"))
     if FFmpeg is None:
         print("  ⚠️  python-ffmpeg not installed — skipping remux")
         shutil.copy2(src, dst)
@@ -1041,30 +1050,40 @@ def process_download(session: tidalapi.Session, url: str):
         num_volumes = getattr(album, "num_volumes", 1) or 1
         width       = max(2, len(str(len(tracks))))
         print(f"💿 {album.name} — {len(tracks)} track(s)")
+        dests = []
         for i, track in enumerate(tracks, 1):
-            print(f"\n  [{i}/{len(tracks)}] {track.name}")
             disc_prefix = f"{getattr(track, 'volume_num', 1)}-" if num_volumes > 1 else ""
             num    = f"{disc_prefix}{str(getattr(track, 'track_num', i)).zfill(width)}"
             artist = sanitize(", ".join(a.name for a in track.artists))
             title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
             exp    = explicit_tag(getattr(track, "explicit", False))
             dest   = OUTPUT_BASE / "Albums" / f"{alb_artist} - {alb_title}{alb_exp}" / f"{num}. {artist} - {title}{exp}"
-            download_track(session, track, dest)
+            dests.append((track, dest))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
+            futs = {ex.submit(download_track, session, track, dest): track for track, dest in dests}
+            for fut in concurrent.futures.as_completed(futs):
+                print(f"  ✔ {futs[fut].name}")
+                fut.result()
     elif media_type in ("playlist", "mix"):
         playlist = session.playlist(media_id)
         items    = playlist.tracks()
         pl_name  = sanitize(playlist.name)
         width    = max(2, len(str(len(items))))
         print(f"📋 {playlist.name} — {len(items)} track(s)")
+        dests = []
         for i, track in enumerate(items, 1):
             if isinstance(track, Video):
                 print(f"  [{i}] ⏭️  Skipping video")
                 continue
-            print(f"\n  [{i}/{len(items)}] {track.name}")
             artist = sanitize(", ".join(a.name for a in track.artists))
             title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
             dest   = OUTPUT_BASE / "Playlists" / pl_name / f"{str(i).zfill(width)}. {artist} - {title}"
-            download_track(session, track, dest)
+            dests.append((track, dest))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
+            futs = {ex.submit(download_track, session, track, dest): track for track, dest in dests}
+            for fut in concurrent.futures.as_completed(futs):
+                print(f"  ✔ {futs[fut].name}")
+                fut.result()
     else:
         sys.exit(f"❌ Unsupported type: {media_type}")
 
@@ -1116,19 +1135,28 @@ def push_to_phone(local_path: pathlib.Path, remote_path: str) -> bool:
 
 
 def _deliver_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib.Path,
-                   destination: str, remote_no_ext: str | None = None) -> bool:
+                   destination: str, remote_no_ext: str | None = None,
+                   push_lock: threading.Lock | None = None) -> bool:
     """Downloads one track and delivers it to the chosen destination.
 
-    'itunes'/'folder': a plain download_track() call. 'phone': downloads to a
-    local temp path, adb-pushes it, then deletes the local copy immediately —
-    never stages more than one track's worth of local disk at a time.
+    'itunes'/'folder': a plain download_track() call — safe to run concurrently,
+    each track gets its own file. 'phone': downloads to a local temp path (also
+    concurrency-safe, one temp file per track), then adb-pushes it. The adb push
+    itself is serialized via push_lock when provided — concurrent adb pushes over
+    a single USB connection are untested, so downloading/remuxing overlaps across
+    tracks but pushes to the phone happen one at a time.
     """
     if destination != "phone":
         return download_track(session, track, dest_no_ext) is not None
     local_final = download_track(session, track, dest_no_ext)
     if local_final is None:
         return False
-    delivered = push_to_phone(local_final, remote_no_ext + local_final.suffix)
+    remote_path = remote_no_ext + local_final.suffix
+    if push_lock is not None:
+        with push_lock:
+            delivered = push_to_phone(local_final, remote_path)
+    else:
+        delivered = push_to_phone(local_final, remote_path)
     local_final.unlink(missing_ok=True)
     return delivered
 
@@ -1149,6 +1177,8 @@ def backup_tidal(session: tidalapi.Session, destination: str,
     copy and its cache entry are left untouched. Deliberate scope boundary.
     """
     cache = load_cache(cache_path)
+    cache_lock = threading.Lock()
+    push_lock  = threading.Lock() if destination == "phone" else None
 
     if destination == "phone":
         base = PHONE_BACKUP_BASE
@@ -1164,10 +1194,30 @@ def backup_tidal(session: tidalapi.Session, destination: str,
         if destination == "phone":
             local_dest  = tmp_dir / str(track.id)
             remote_dest = f"{base}/{remote_rel}"
-            return _deliver_track(session, track, local_dest, "phone", remote_dest)
+            return _deliver_track(session, track, local_dest, "phone", remote_dest, push_lock)
         return _deliver_track(session, track, Path(base) / local_rel, destination)
 
     delivered_count = skipped_count = 0
+    counts_lock = threading.Lock()
+
+    def process_one(track: Track, local_rel: pathlib.Path, remote_rel: str,
+                    key: str, scope: str, artist: str, title: str) -> None:
+        nonlocal delivered_count
+        if deliver(track, local_rel, remote_rel):
+            with cache_lock:
+                cache[key] = {"tidal_id": str(track.id), "artist": artist, "title": title, "playlist": scope}
+                save_cache(cache_path, cache)
+            with counts_lock:
+                delivered_count += 1
+
+    def run_batch(jobs: list[tuple]) -> None:
+        if not jobs:
+            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
+            futs = [ex.submit(process_one, *job) for job in jobs]
+            for fut in concurrent.futures.as_completed(futs):
+                fut.result()
+
     try:
         print("📋 Enumerating owned playlists...")
         playlists = list(_iter_owned_playlists(session))
@@ -1179,6 +1229,7 @@ def backup_tidal(session: tidalapi.Session, destination: str,
             print(f"{'─'*55}")
             tracks = pl.tracks_paginated()
             width = max(2, len(str(len(tracks))))
+            jobs = []
             for i, track in enumerate(tracks, 1):
                 if isinstance(track, Video):
                     continue
@@ -1193,16 +1244,15 @@ def backup_tidal(session: tidalapi.Session, destination: str,
                 print(f"  [{i}/{len(tracks)}] {artist} - {title}")
                 local_rel  = pathlib.Path("Playlists") / sanitize(pl.name) / fname
                 remote_rel = f"Playlists/{sanitize(pl.name)}/{fname}"
-                if deliver(track, local_rel, remote_rel):
-                    cache[key] = {"tidal_id": str(track.id), "artist": artist, "title": title, "playlist": scope}
-                    save_cache(cache_path, cache)
-                    delivered_count += 1
+                jobs.append((track, local_rel, remote_rel, key, scope, artist, title))
+            run_batch(jobs)
 
         print(f"\n{'─'*55}")
         print(f"💛  Liked Songs")
         print(f"{'─'*55}")
         liked = session.user.favorites.tracks_paginated()
         print(f"✅ Found {len(liked)} liked track(s)\n")
+        jobs = []
         for i, track in enumerate(liked, 1):
             scope = "liked"
             key = f"{scope}::{track.id}"
@@ -1216,10 +1266,8 @@ def backup_tidal(session: tidalapi.Session, destination: str,
             print(f"  [{i}/{len(liked)}] {artist} - {title}")
             local_rel  = pathlib.Path("Liked Songs") / fname
             remote_rel = f"Liked Songs/{fname}"
-            if deliver(track, local_rel, remote_rel):
-                cache[key] = {"tidal_id": str(track.id), "artist": artist, "title": title, "playlist": scope}
-                save_cache(cache_path, cache)
-                delivered_count += 1
+            jobs.append((track, local_rel, remote_rel, key, scope, artist, title))
+        run_batch(jobs)
     finally:
         if tmp_dir_ctx:
             tmp_dir_ctx.cleanup()
