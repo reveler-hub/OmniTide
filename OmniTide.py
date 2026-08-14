@@ -132,15 +132,21 @@ ITUNES_LIBRARY_PATHS = {
 # ── Auth (with auto‑refresh) ──────────────────────────────────────────────
 
 def _save_token(session: tidalapi.Session, token_path: Path):
-    with open(token_path, "w") as f:
-        json.dump({
-            "token_type":    session.token_type,
-            "access_token":  session.access_token,
-            "refresh_token": session.refresh_token,
-            "expiry_time":   session.expiry_time.timestamp() if session.expiry_time else 0.0,
-        }, f, indent=4)
-    if os.name != "nt":
-        os.chmod(token_path, stat.S_IRUSR | stat.S_IWUSR)
+    fd, tmp_path = tempfile.mkstemp(dir=token_path.parent, prefix=".omnitide_token_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump({
+                "token_type":    session.token_type,
+                "access_token":  session.access_token,
+                "refresh_token": session.refresh_token,
+                "expiry_time":   session.expiry_time.timestamp() if session.expiry_time else 0.0,
+            }, f, indent=4)
+        if os.name != "nt":
+            os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp_path, token_path)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
@@ -154,8 +160,16 @@ def load_session(token_path: Path) -> tuple[tidalapi.Session, str]:
         print("✅ Logged in and token saved.\n")
         return session, session.access_token
 
-    with open(token_path) as f:
-        data = json.load(f)
+    try:
+        with open(token_path) as f:
+            data = json.load(f)
+        if not all(k in data for k in ("token_type", "access_token", "refresh_token", "expiry_time")):
+            raise KeyError("missing required token field(s)")
+    except (OSError, json.JSONDecodeError, KeyError) as e:
+        print(f"❌ Corrupt or unreadable token file: {e}")
+        print("🔄 Deleting token.json – please re-run `login`.")
+        token_path.unlink(missing_ok=True)
+        sys.exit(1)
 
     session = tidalapi.Session(tidalapi.Config(quality=Quality.hi_res_lossless))
 
@@ -310,7 +324,7 @@ def scan_phone_via_adb(read_tags: bool = False) -> dict[str, dict[str, str]]:
     print("📱 Scanning phone via ADB...")
     try:
         result = subprocess.run(
-            ["adb", "shell", "find", "/sdcard/Music", "-type", "f"],
+            ["adb", "shell", "find", "/sdcard/Music", "-type", ""],
             capture_output=True, text=True, timeout=60
         )
         if result.returncode != 0 or not result.stdout.strip():
@@ -528,8 +542,11 @@ def find_itunes_library() -> Path | None:
 def parse_itunes_library(xml_path: Path) -> dict[str, dict[str, str]]:
     """Returns {itunes_track_id: {artist, title, tidal_id: "", playlist}}."""
     print(f"📖 Reading iTunes library: {xml_path}")
-    with open(xml_path, "rb") as f:
-        library = plistlib.load(f)
+    try:
+        with open(xml_path, "rb") as f:
+            library = plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException) as e:
+        sys.exit(f"❌ Could not read iTunes library at {xml_path}: {e}")
     raw_tracks = library.get("Tracks", {})
     tracks: dict[str, tuple[str, str]] = {}
     for tid, info in raw_tracks.items():
@@ -630,7 +647,7 @@ def sync_incremental(session: tidalapi.Session, access_token: str,
                 track = search_track(session, rec["artist"], rec["title"], rec["tidal_id"] or None)
                 time.sleep(0.5)
                 if not track:
-                    print(f"    ❌ No match")
+                    print("    ❌ No match")
                     all_unmatched.append(f"[{source_label}] [{playlist_name}] {display}")
                     continue
                 print(f"    🔍 {', '.join(a.name for a in track.artists)} - {track.name}")
@@ -748,7 +765,7 @@ def add_tracks_batch(session: tidalapi.Session, access_token: str, playlist,
                         break  # fallback
 
                 if raw.status_code == 400:
-                    print(f"    ⚠️  Batch 400 – falling back to individual adds for this chunk...")
+                    print("    ⚠️  Batch 400 – falling back to individual adds for this chunk...")
                     break  # fallback
 
                 if not raw.ok:
@@ -786,7 +803,12 @@ def add_tracks_batch(session: tidalapi.Session, access_token: str, playlist,
         # If batch failed for this chunk, add individually
         if not success:
             for tid in chunk:
-                if add_track_with_retry(session, access_token, playlist, tid, retries=1, delay=1):
+                # Use the session's live token, not the possibly-stale local copy —
+                # add_track_with_retry refreshes its own local parameter on a 401,
+                # which doesn't propagate back here, so a stale token would otherwise
+                # re-trigger an unnecessary 401→refresh round trip for every
+                # subsequent track in this fallback loop.
+                if add_track_with_retry(session, session.access_token, playlist, tid, retries=1, delay=1):
                     added.append(tid)
 
         time.sleep(1)  # short delay between chunks
@@ -823,10 +845,10 @@ def diff_scan(scanned: dict[str, dict[str, str]],
 def confirm_removal(source_label: str, playlist_name: str, count: int) -> bool:
     if not sys.stdin.isatty():
         print(f"    ⚠️  {count} track(s) gone from {source_label} for '{playlist_name}' — "
-              f"not removing from Tidal (no interactive terminal to confirm).")
+              "not removing from Tidal (no interactive terminal to confirm).")
         return False
     answer = input(f"    {count} track(s) gone from {source_label} for '{playlist_name}'. "
-                   f"Remove them from the Tidal playlist too? [y/N] ").strip().lower()
+                   "Remove them from the Tidal playlist too? [y/N] ").strip().lower()
     return answer == "y"
 
 
@@ -909,7 +931,7 @@ def _ffmpeg_remux(src: pathlib.Path, dst_no_ext: pathlib.Path, codec: str) -> pa
     # Path.with_suffix() would treat a literal "." in the filename itself
     # (e.g. "01. Artist - Title") as the extension to replace, truncating
     # everything after it — plain string concatenation avoids that.
-    dst = pathlib.Path(str(dst_no_ext) + (".flac" if is_lossless else ".m4a"))
+    dst = Path(str(dst_no_ext) + (".flac" if is_lossless else ".m4a"))
     if FFmpeg is None:
         print("  ⚠️  python-ffmpeg not installed — skipping remux")
         shutil.copy2(src, dst)
@@ -928,17 +950,23 @@ def _ffmpeg_remux(src: pathlib.Path, dst_no_ext: pathlib.Path, codec: str) -> pa
     return dst
 
 
+def _resolve_artists(track: Track, album) -> tuple[str, str]:
+    """Returns (track_artists, album_artist) as comma-joined display strings.
+    Falls back to the track artists when the album has no main-role artist."""
+    artists = ", ".join(a.name for a in track.artists)
+    alb_artist = ", ".join(
+        a.name for a in album.artists
+        if any("MAIN" in str(r).upper() for r in getattr(a, "roles", []))
+    ) if album and hasattr(album, "artists") else artists
+    return artists, (alb_artist or artists)
+
+
 def _embed_metadata(path_file: pathlib.Path, track: Track, cover: bytes | None, playlist: str | None = None):
     try:
         m = mutagen.flac.FLAC(str(path_file))
         album = track.album
         if not m.tags: m.add_tags()
-        artists    = ", ".join(a.name for a in track.artists)
-        alb_artist = ", ".join(
-            a.name for a in album.artists
-            if any("MAIN" in str(r).upper() for r in getattr(a, "roles", []))
-        ) if album and hasattr(album, "artists") else artists
-        if not alb_artist: alb_artist = artists
+        artists, alb_artist = _resolve_artists(track, album)
         m.tags["TITLE"]       = track.full_name if hasattr(track, "full_name") else track.name
         m.tags["ARTIST"]      = artists
         m.tags["ALBUMARTIST"] = alb_artist
@@ -969,12 +997,7 @@ def _embed_metadata_mp4(path_file: pathlib.Path, track: Track, cover: bytes | No
         m = mutagen.mp4.MP4(str(path_file))
         album = track.album
         if not m.tags: m.add_tags()
-        artists    = ", ".join(a.name for a in track.artists)
-        alb_artist = ", ".join(
-            a.name for a in album.artists
-            if any("MAIN" in str(r).upper() for r in getattr(a, "roles", []))
-        ) if album and hasattr(album, "artists") else artists
-        if not alb_artist: alb_artist = artists
+        artists, alb_artist = _resolve_artists(track, album)
         m.tags["\xa9nam"] = track.full_name if hasattr(track, "full_name") else track.name
         m.tags["\xa9ART"] = artists
         m.tags["aART"]    = alb_artist
@@ -1012,9 +1035,20 @@ class _RateLimitTracker:
     def __init__(self, window: int = 20):
         self.outcomes: deque[bool] = deque(maxlen=window)  # True = was rate-limited
         self._cooldown_stage = 0
+        self._clean_streak = 0  # consecutive non-rate-limited acquisitions since the last trip
 
     def record(self, was_rate_limited: bool) -> None:
         self.outcomes.append(was_rate_limited)
+        if was_rate_limited:
+            self._clean_streak = 0
+        else:
+            self._clean_streak += 1
+            # A full window's worth of clean behavior earns back one escalation
+            # level, so a rough patch early in a long run doesn't permanently
+            # pin every later cooldown at the max even after hours of clean runs.
+            if self._clean_streak >= self.outcomes.maxlen and self._cooldown_stage > 0:
+                self._cooldown_stage -= 1
+                self._clean_streak = 0
 
     def hit_rate(self) -> float:
         return (sum(self.outcomes) / len(self.outcomes)) if self.outcomes else 0.0
@@ -1075,15 +1109,18 @@ def _acquire_stream(session: tidalapi.Session, track: Track, dest_no_ext: pathli
     None if the track can't be acquired.
     """
     for ext in (".flac", ".m4a"):
-        existing = pathlib.Path(str(dest_no_ext) + ext)
+        existing = Path(str(dest_no_ext) + ext)
         if existing.exists():
             print(f"  ↪️  Exists: {existing.name}")
             return existing
     if not getattr(track, "allow_streaming", False):
         print(f"  ⚠️  Not streamable: {track.name}")
         return None
+    if tracker is not None:
+        _check_circuit_breaker(tracker)
     was_rate_limited = False
-    for attempt in range(3):
+    retries = 3
+    for attempt in range(retries):
         try:
             full_track = session.track(str(track.id), with_album=True)
             stream     = full_track.get_stream()
@@ -1091,9 +1128,10 @@ def _acquire_stream(session: tidalapi.Session, track: Track, dest_no_ext: pathli
             break
         except TooManyRequests as e:
             was_rate_limited = True
-            wait = e.retry_after if e.retry_after > 0 else 15
-            print(f"  ⏳ Rate limited, waiting {wait}s (attempt {attempt + 1}/3)...")
-            time.sleep(wait)
+            if attempt < retries - 1:
+                wait = e.retry_after if e.retry_after > 0 else 15
+                print(f"  ⏳ Rate limited, waiting {wait}s (attempt {attempt + 1}/{retries})...")
+                time.sleep(wait)
         except Exception as e:
             print(f"  ❌ Stream error: {e}")
             if tracker is not None:
@@ -1102,12 +1140,12 @@ def _acquire_stream(session: tidalapi.Session, track: Track, dest_no_ext: pathli
     else:
         if tracker is not None:
             tracker.record(True)
-        print(f"  ❌ Still rate limited after 3 attempts — skipping")
+        print(f"  ❌ Still rate limited after {retries} attempts — skipping")
         return None
     if tracker is not None:
         tracker.record(was_rate_limited)
     if manifest.is_encrypted:
-        print(f"  ⚠️  Encrypted stream — skipping")
+        print("  ⚠️  Encrypted stream — skipping")
         return None
     lo, hi = tracker.pacing_range() if tracker is not None else (2, 8)
     time.sleep(random.uniform(lo, hi))
@@ -1123,20 +1161,20 @@ def _download_and_process(full_track: Track, stream, manifest, dest_no_ext: path
     """
     dest_no_ext.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=manifest.file_extension, delete=False) as tmp:
-        tmp_path = pathlib.Path(tmp.name)
+        tmp_path = Path(tmp.name)
     print(f"  ⬇️  {full_track.name} ({len(manifest.get_urls())} segment(s))")
     if not _download_segments(manifest.get_urls(), tmp_path):
         tmp_path.unlink(missing_ok=True)
         return None
-    print(f"  🔧 Remuxing...")
+    print("  🔧 Remuxing...")
     dest_final = _ffmpeg_remux(tmp_path, dest_no_ext, manifest.codecs)
     tmp_path.unlink(missing_ok=True)
     if not dest_final.exists():
-        print(f"  ❌ Output file not created")
+        print("  ❌ Output file not created")
         return None
     is_lossless = dest_final.suffix == ".flac"
     if not is_lossless:
-        print(f"  ⚠️  No MAX (lossless) quality version on Tidal for this track — delivered "
+        print("  ⚠️  No MAX (lossless) quality version on Tidal for this track — delivered "
               f"at {stream.audio_quality} (lossy), saving as .m4a")
     cover = cover_bytes(full_track.album) if full_track.album else None
     if is_lossless:
@@ -1156,6 +1194,33 @@ def download_track(session: tidalapi.Session, track: Track, dest_no_ext: pathlib
     return _download_and_process(full_track, stream, manifest, dest_no_ext)
 
 
+def _acquire_all(session: tidalapi.Session, tracker: "_RateLimitTracker",
+                 items: list[tuple[Track, pathlib.Path, object]]):
+    """Acquires stream manifests for many tracks, one at a time (Tidal
+    rate-limits that endpoint hard, so pacing adapts and auto-pauses if hits
+    start clustering — handled inside _acquire_stream itself).
+
+    items: (track, dest, extra) — extra is caller-supplied per-item data,
+    passed through untouched, for tracks already-downloaded or ready to go.
+
+    Returns (already, jobs):
+    - already: (existing_path, extra) for tracks that were already downloaded
+    - jobs: (full_track, stream, manifest, dest, extra) ready to download
+    """
+    already = []
+    jobs = []
+    for track, dest, extra in items:
+        acquired = _acquire_stream(session, track, dest, tracker)
+        if acquired is None:
+            continue
+        if isinstance(acquired, pathlib.Path):
+            already.append((acquired, extra))
+            continue
+        full_track, stream, manifest = acquired
+        jobs.append((full_track, stream, manifest, dest, extra))
+    return already, jobs
+
+
 def _download_many(session: tidalapi.Session, dests: list[tuple[Track, pathlib.Path]],
                    playlist: str | None = None) -> None:
     """Downloads many tracks: acquires stream manifests one at a time (Tidal
@@ -1163,20 +1228,17 @@ def _download_many(session: tidalapi.Session, dests: list[tuple[Track, pathlib.P
     start clustering), then downloads/remuxes/tags concurrently — up to
     MAX_CONCURRENT_DOWNLOADS — since that stage only talks to the CDN."""
     tracker = _RateLimitTracker()
-    jobs = []
-    for track, dest in dests:
-        _check_circuit_breaker(tracker)
-        acquired = _acquire_stream(session, track, dest, tracker)
-        if acquired is None or isinstance(acquired, pathlib.Path):
-            continue
-        full_track, stream, manifest = acquired
-        jobs.append((full_track, stream, manifest, dest))
+    items = [(track, dest, None) for track, dest in dests]
+    _already, jobs = _acquire_all(session, tracker, items)
     if not jobs:
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
-        futs = [ex.submit(_download_and_process, ft, st, mf, dest, playlist) for ft, st, mf, dest in jobs]
+        futs = [ex.submit(_download_and_process, ft, st, mf, dest, playlist) for ft, st, mf, dest, _ in jobs]
         for fut in concurrent.futures.as_completed(futs):
-            fut.result()
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"  ❌ Worker error: {e}")
 
 
 def parse_tidal_url(url: str) -> tuple[str, str]:
@@ -1187,16 +1249,17 @@ def parse_tidal_url(url: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
-def process_download(session: tidalapi.Session, url: str):
+def process_download(session: tidalapi.Session, url: str, output_dir: Path | None = None):
+    output_base = output_dir or OUTPUT_BASE
     media_type, media_id = parse_tidal_url(url)
     print(f"\n🔍 {media_type}  (id: {media_id})")
-    print(f"📁 Output: {OUTPUT_BASE}\n")
+    print(f"📁 Output: {output_base}\n")
     if media_type == "track":
         track = session.track(media_id, with_album=True)
         artist = sanitize(", ".join(a.name for a in track.artists))
         title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
         exp    = explicit_tag(getattr(track, "explicit", False))
-        download_track(session, track, OUTPUT_BASE / "Tracks" / f"{artist} - {title}{exp}")
+        download_track(session, track, output_base / "Tracks" / f"{artist} - {title}{exp}")
     elif media_type == "album":
         album  = session.album(media_id)
         tracks = album.tracks()
@@ -1213,7 +1276,7 @@ def process_download(session: tidalapi.Session, url: str):
             artist = sanitize(", ".join(a.name for a in track.artists))
             title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
             exp    = explicit_tag(getattr(track, "explicit", False))
-            dest   = OUTPUT_BASE / "Albums" / f"{alb_artist} - {alb_title}{alb_exp}" / f"{num}. {artist} - {title}{exp}"
+            dest   = output_base / "Albums" / f"{alb_artist} - {alb_title}{alb_exp}" / f"{num}. {artist} - {title}{exp}"
             dests.append((track, dest))
         _download_many(session, dests)
     elif media_type in ("playlist", "mix"):
@@ -1229,7 +1292,7 @@ def process_download(session: tidalapi.Session, url: str):
                 continue
             artist = sanitize(", ".join(a.name for a in track.artists))
             title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
-            dest   = OUTPUT_BASE / "Playlists" / pl_name / f"{str(i).zfill(width)}. {artist} - {title}"
+            dest   = output_base / "Playlists" / pl_name / f"{str(i).zfill(width)}. {artist} - {title}"
             dests.append((track, dest))
         _download_many(session, dests, playlist=playlist.name)
     else:
@@ -1376,24 +1439,22 @@ def backup_tidal(session: tidalapi.Session, destination: str,
         """
         if not entries:
             return
-        jobs = []
+        items = []
         for track, local_rel, remote_rel, key, scope, artist, title in entries:
-            _check_circuit_breaker(tracker)
             dest_no_ext = (tmp_dir / str(track.id)) if destination == "phone" else Path(base) / local_rel
-            acquired = _acquire_stream(session, track, dest_no_ext, tracker)
-            if acquired is None:
-                continue
-            if isinstance(acquired, pathlib.Path):
-                mark_delivered(key, scope, track, artist, title)
-                continue
-            full_track, stream, manifest = acquired
-            jobs.append((full_track, stream, manifest, dest_no_ext, remote_rel, key, scope, artist, title, track))
+            items.append((track, dest_no_ext, (remote_rel, key, scope, artist, title, track)))
+        already, jobs = _acquire_all(session, tracker, items)
+        for _path, (remote_rel, key, scope, artist, title, track) in already:
+            mark_delivered(key, scope, track, artist, title)
         if not jobs:
             return
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as ex:
-            futs = [ex.submit(process_one, *job) for job in jobs]
+            futs = [ex.submit(process_one, ft, st, mf, dest, *extra) for ft, st, mf, dest, extra in jobs]
             for fut in concurrent.futures.as_completed(futs):
-                fut.result()
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"  ❌ Worker error: {e}")
 
     try:
         print("📋 Enumerating owned playlists...")
@@ -1419,13 +1480,13 @@ def backup_tidal(session: tidalapi.Session, destination: str,
                 title  = sanitize(track.full_name if hasattr(track, "full_name") else track.name)
                 fname  = f"{str(i).zfill(width)}. {artist} - {title}"
                 print(f"  [{i}/{len(tracks)}] {artist} - {title}")
-                local_rel  = pathlib.Path("Playlists") / sanitize(pl.name) / fname
+                local_rel  = Path("Playlists") / sanitize(pl.name) / fname
                 remote_rel = f"Playlists/{sanitize(pl.name)}/{fname}"
                 jobs.append((track, local_rel, remote_rel, key, scope, artist, title))
             run_batch(jobs)
 
         print(f"\n{'─'*55}")
-        print(f"💛  Liked Songs")
+        print("💛  Liked Songs")
         print(f"{'─'*55}")
         liked = session.user.favorites.tracks_paginated()
         print(f"✅ Found {len(liked)} liked track(s)\n")
@@ -1441,7 +1502,7 @@ def backup_tidal(session: tidalapi.Session, destination: str,
             exp    = explicit_tag(getattr(track, "explicit", False))
             fname  = f"{artist} - {title}{exp}"
             print(f"  [{i}/{len(liked)}] {artist} - {title}")
-            local_rel  = pathlib.Path("Liked Songs") / fname
+            local_rel  = Path("Liked Songs") / fname
             remote_rel = f"Liked Songs/{fname}"
             jobs.append((track, local_rel, remote_rel, key, scope, artist, title))
         run_batch(jobs)
@@ -1491,7 +1552,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     phone_parser = sync_sources.add_parser("phone", parents=[sync_common],
                                            help="Sync from an Android phone over ADB")
     phone_parser.add_argument("--cache-file", type=str, default=None, metavar="FILE",
-                              help=f"Where to store the incremental phone-scan cache "
+                              help="Where to store the incremental phone-scan cache "
                                    f"(default: {PHONE_CACHE_PATH})")
     phone_parser.add_argument("--read-tags", action="store_true",
                               help="Read ARTIST/TITLE/TIDALID from each file's embedded tags instead of "
@@ -1503,7 +1564,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     itunes_parser.add_argument("--path", type=str, metavar="XML",
                                help="Path to iTunes Music Library.xml (auto-detected if omitted)")
     itunes_parser.add_argument("--cache-file", type=str, default=None, metavar="FILE",
-                               help=f"Where to store the incremental iTunes-scan cache "
+                               help="Where to store the incremental iTunes-scan cache "
                                     f"(default: {ITUNES_CACHE_PATH})")
 
     download_parser = commands.add_parser("download", help="Download a track, album, or playlist from Tidal")
@@ -1558,11 +1619,8 @@ def main():
 
     if args.command == "download":
         _require_ffmpeg()
-        if args.dest:
-            global OUTPUT_BASE
-            OUTPUT_BASE = Path(args.dest)
         print("\n🚀 Downloading...")
-        process_download(session, args.url)
+        process_download(session, args.url, output_dir=Path(args.dest) if args.dest else None)
         print("\n✨ Done.")
         return
 
@@ -1581,4 +1639,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Cancelled.")
+        sys.exit(130)
