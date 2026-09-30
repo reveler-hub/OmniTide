@@ -1,6 +1,6 @@
 # OmniTide
 
-Sync your Android phone or iTunes/Apple Music library to Tidal as real playlists, download tracks/albums/playlists as full-metadata FLAC files, and back up your entire Tidal account — all from one single-file Python tool, no third-party sync service required.
+Sync your Android phone or iTunes/Apple Music library to Tidal as real playlists, download tracks/albums/playlists with full metadata in the best quality Tidal offers (lossless FLAC, or M4A when no lossless master exists), and back up your entire Tidal account — all from one single-file Python tool, no third-party sync service required.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -9,7 +9,7 @@ Sync your Android phone or iTunes/Apple Music library to Tidal as real playlists
 A single-file Python tool that does three things:
 
 - **Sync** — Scans your Android phone or iTunes/Apple Music library and creates matching playlists on Tidal
-- **Download** — Downloads tracks, albums, or playlists from Tidal as FLAC files with full metadata and album art
+- **Download** — Downloads tracks, albums, or playlists from Tidal with full metadata and album art — lossless FLAC where available, M4A otherwise
 - **Backup** — Downloads your entire Tidal account (every playlist you own, plus Liked Songs) to your phone, an iTunes-import folder, or the current folder
 
 No third‑party sync services. Just a Tidal account.
