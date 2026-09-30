@@ -324,7 +324,7 @@ def scan_phone_via_adb(read_tags: bool = False) -> dict[str, dict[str, str]]:
     print("📱 Scanning phone via ADB...")
     try:
         result = subprocess.run(
-            ["adb", "shell", "find", "/sdcard/Music", "-type", ""],
+            ["adb", "shell", "find", "/sdcard/Music", "-type", "f"],
             capture_output=True, text=True, timeout=60
         )
         if result.returncode != 0 or not result.stdout.strip():
