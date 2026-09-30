@@ -258,6 +258,38 @@ def _extract_tags(audio) -> tuple[str, str, str]:
     return artist, title, tidal_id
 
 
+def _mp4_with_trailing_moov(remote_path: str, head: bytes) -> bytes | None:
+    """Rebuild a parseable MP4 buffer when the moov atom (which holds the tags)
+    sits after a large mdat, as in non-"faststart" files.
+
+    Walks the top-level atoms in head; at the first one that runs past the end
+    of head, fetches only the rest of the file after it (or from the moov
+    itself, if that's the one cut off) and splices that onto the atoms before
+    it, skipping the audio data. Returns None if moov is already complete in
+    head or the layout can't be followed.
+    """
+    pos = 0
+    while pos + 8 <= len(head):
+        size = int.from_bytes(head[pos:pos + 4], "big")
+        kind = head[pos + 4:pos + 8]
+        if size == 1:
+            if pos + 16 > len(head):
+                return None
+            size = int.from_bytes(head[pos + 8:pos + 16], "big")
+        if size < 8:
+            return None  # size 0 ("runs to EOF") or corrupt
+        if pos + size > len(head):
+            start = pos if kind == b"moov" else pos + size
+            result = subprocess.run(
+                ["adb", "exec-out", f"tail -c +{start + 1} {shlex.quote(remote_path)}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+            return head[:pos] + result.stdout if result.stdout else None
+        if kind == b"moov":
+            return None
+        pos += size
+    return None
+
+
 def _read_remote_tags(remote_path: str, chunk_size: int = 2 * 1024 * 1024) -> tuple[str, str, str]:
     """Best-effort tag read from a phone file via a partial ADB pull.
 
@@ -280,6 +312,8 @@ def _read_remote_tags(remote_path: str, chunk_size: int = 2 * 1024 * 1024) -> tu
         data = proc.stdout.read(chunk_size)
         if not data:
             return "", "", ""
+        if tag_class is mutagen.mp4.MP4:
+            data = _mp4_with_trailing_moov(remote_path, data) or data
         return _extract_tags(tag_class(io.BytesIO(data)))
     except Exception:
         return "", "", ""
